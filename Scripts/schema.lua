@@ -1,10 +1,12 @@
+local Boot = require('Boot')
+
 return {
   id = 'PBZMoHUD',
   name = 'hud.name',
   label = 'hud.name',
   about = 'hud.about',
   author = 'Moirstral',
-  version = '1.0.1',
+  version = Boot.VERSION,
   groups = {
     { label = 'hud.group.preset', controls = {
       { id = 'Layout', type = 'preset', label = 'hud.Layout', tip = 'hud.Layout.tip', default = 'normal', effect = 'immediate',

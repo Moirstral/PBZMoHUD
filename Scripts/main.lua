@@ -325,15 +325,6 @@ local reader = Reader.new(env, {
 local drag = DragMode.new(S, icons, reader, log)
 local configVisible = false
 
--- 崩溃现场定位用：只在 Debug 打开时，按「子系统切换」打一行。真崩了以后
--- 日志最后一行就是崩之前正在跑的子系统，比事后猜便宜得多。
-local lastMark = nil
-local function mark(name)
-  if not debugOn or name == lastMark then return end
-  lastMark = name
-  log('phase: ' .. name)
-end
-
 ---------------------------------------------------------------------------------------------------
 -- 拖动期间的输入接管。框架把面板临时收起（temp）时会把输入交还游戏
 -- （GameOnly + 隐藏光标），于是拖动时没有光标、鼠标还会操作角色。这里在拖动
@@ -739,7 +730,6 @@ local function step(dt)
     pendingColours = false
   end
 
-  mark('stats')
   local snapshot, statsError = readSnapshot(now)
   local trace = S.Debug and snapshot ~= nil and traceTicks < 3
   if trace then
@@ -747,7 +737,6 @@ local function step(dt)
     log('trace ' .. traceTicks .. ': stats ok')
   end
 
-  mark('follow')
   local anchorX, anchorY, onscreen
   if snapshot then
     local fx, fy, visible, _, scale = follow:update(snapshot, dt)
@@ -775,7 +764,6 @@ local function step(dt)
     end
   end
 
-  mark('hud')
   -- 等门期间不用 0.05s 采样缓存：HUD 硬切出现时要当帧就认出来。
   local hudShown, hudOpacity = hudVisible(not heavyReady)
   -- 游戏 HUD 的连续不透明度就是「淡出开始」的最早状态：RenderOpacity 刚从
@@ -884,7 +872,6 @@ local function step(dt)
   end
   local breakActive = breakWatch:update(snapshot and snapshot.pawn, now, heavyReady)
 
-  mark('icons')
   if heavyReady then
     local iconsOk, iconsErr = pcall(function()
       icons:update(dt, {
@@ -905,7 +892,6 @@ local function step(dt)
     pcall(function() icons:setShown(false, 0) end)
   end
 
-  mark('bars')
   if heavyReady then
     -- 配置面板开着时玩家随时在改原生条相关设置，全程保持高频。
     if hudReturned or configVisible then hudBars:wake(hudReturned) end
@@ -929,7 +915,6 @@ local function step(dt)
   end
   if master < 0.01 and target == 0 then master = 0 end
 
-  mark('render')
   -- 破防演示：到点放回面板；面板被玩家手动开/关则取消。演示期间只把喂给
   -- 渲染器的快照副本里的杀气清零并强制破防色，真实统计与游戏数据不动。
   local renderSnapshot, renderBreak = snapshot, breakActive
