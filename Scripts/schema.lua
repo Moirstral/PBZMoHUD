@@ -4,7 +4,7 @@ return {
   label = 'hud.name',
   about = 'hud.about',
   author = 'Moirstral',
-  version = '1.0.0',
+  version = '1.0.1',
   groups = {
     { label = 'hud.group.preset', controls = {
       { id = 'Layout', type = 'preset', label = 'hud.Layout', tip = 'hud.Layout.tip', default = 'normal', effect = 'immediate',
