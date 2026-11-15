@@ -24,11 +24,15 @@ function Log:write(msg)
     if not open(self, 'ab') then return false end
     local ok, size = pcall(self.handle.seek, self.handle, 'end')
     self.size = ok and size or 0
-  end
-  if self.size + #text > LIMIT then
-    release(self)
-    if not open(self, 'wb') then return false end
-    self.size = 0
+    -- 只在本次启动第一次打开时清理：游戏中途不清空，崩溃前的日志才能留到下次启动。
+    if not self.started then
+      self.started = true
+      if self.size > LIMIT then
+        release(self)
+        if not open(self, 'wb') then return false end
+        self.size = 0
+      end
+    end
   end
   local ok, result = pcall(function()
     if not self.handle:write(text) then return false end
