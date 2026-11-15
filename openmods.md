@@ -1,6 +1,6 @@
 # PBZMoHUD
 
-Ink-wash arc health and Qi bars for Phantom Blade Zero, with per-arc layout, colours, ghost trails and brush tips, plus medicine and Qi icons drawn over the game HUD.
+Individually adjustable HP and Sha-Chi arcs for Phantom Blade Zero, with potion, Sha-Chi Essence and Dark Source icons. Reads player values without changing game data.
 
 ## What it does
 
@@ -16,7 +16,7 @@ Ink-wash arc health and Qi bars for Phantom Blade Zero, with per-arc layout, col
 
 ## How to install
 
-1. Install UE4SS 3.x for Phantom Blade Zero. For the in-game settings panel, live preview and icon dragging, also install PBZMoConfig with event and deferred-save support.
+1. Install UE4SS for Phantom Blade Zero. For the in-game settings panel, live preview and icon dragging, also install PBZMoConfig with event and deferred-save support.
 2. Get the mod files: download the archive from the latest GitHub release, or copy the `PBZMoHUD` folder from this repository.
 3. Close the game, then put the folder at `<game>/platform/steam/ue4ss/Mods/PBZMoHUD`, keeping `Scripts/`, `lang/` and `enabled.txt`.
 4. Start the game. If `Scripts/settings.ini` is missing the HUD uses defaults; it never creates or rewrites that file on startup.

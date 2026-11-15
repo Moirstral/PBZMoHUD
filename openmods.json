@@ -2,12 +2,12 @@
   "$schema": "https://openmods.nexus/openmods.schema.json",
   "openmods": 1,
   "name": "PBZMoHUD",
-  "summary": "Ink-wash arc health and Qi bars with adjustable layout, colours and icons, configured in-game through PBZMoConfig.",
+  "summary": "Individually adjustable HP and Sha-Chi arcs for Phantom Blade Zero, with potion, Sha-Chi Essence and Dark Source icons. Reads player values without changing game data.",
   "games": ["phantom-blade-zero"],
   "tags": ["ui", "quality-of-life", "immersion"],
   "cover": "cover.png",
   "requires": [
-    "UE4SS 3.x with ModRef shared variables",
+    "UE4SS (required)",
     "PBZMoConfig (optional: only for the settings panel, live preview and icon dragging)"
   ]
 }
