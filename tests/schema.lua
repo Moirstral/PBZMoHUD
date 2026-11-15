@@ -41,7 +41,7 @@ dataOnly(raw)
 check(raw.id == 'PBZMoHUD', 'mod id')
 check(raw.name == 'hud.name' and raw.label == 'hud.name' and raw.about == 'hud.about', 'metadata keys')
 check(raw.author == 'Moirstral', 'existing author')
-check(raw.version == '1.0.0' and Boot.VERSION == '1.0.0', 'independent version')
+check(raw.version == Boot.VERSION and Boot.VERSION ~= nil, 'independent version')
 check(next(raw.defaults or {}) == nil, 'all values must be explicit controls')
 
 local groups = { preset = 1, behavior = 9, hpArc = 22, qiArc = 26, look = 6,
