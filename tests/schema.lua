@@ -33,18 +33,32 @@ local function dataOnly(t)
 end
 
 local source = read(SCRIPTS .. '/schema.lua')
-for _, token in ipairs({ 'require', 'dofile', 'function' }) do
+for _, token in ipairs({ 'dofile', 'loadfile', 'function' }) do
   check(not source:match('%f[%a_]' .. token .. '%f[^%w_]'), 'schema contains ' .. token)
 end
-local raw = assert(load(source, '@schema.lua', 't', {}))()
+-- 版本号取自 Boot.VERSION；schema 只允许 require('Boot') 这一个外部依赖。
+-- 加载时给一张只含 require 的空环境，顺带挡住任何其它全局访问。
+local bootRequire = "require%s*%(%s*['\"]Boot['\"]%s*%)"
+check(source:match(bootRequire) ~= nil, 'schema version must come from Boot')
+local stripped = source:gsub(bootRequire, '')
+check(not stripped:match('%f[%a_]require%f[^%w_]'),
+  'schema contains unapproved require')
+local schemaEnv = { require = function(name)
+  check(name == 'Boot', 'schema may only require Boot')
+  return Boot
+end }
+local function loadSchema()
+  return assert(load(source, '@schema.lua', 't', schemaEnv))()
+end
+local raw = loadSchema()
 dataOnly(raw)
 check(raw.id == 'PBZMoHUD', 'mod id')
 check(raw.name == 'hud.name' and raw.label == 'hud.name' and raw.about == 'hud.about', 'metadata keys')
 check(raw.author == 'Moirstral', 'existing author')
-check(raw.version == Boot.VERSION and Boot.VERSION ~= nil, 'independent version')
+check(raw.version == Boot.VERSION and Boot.VERSION ~= nil, 'schema version follows Boot.VERSION')
 check(next(raw.defaults or {}) == nil, 'all values must be explicit controls')
 
-local groups = { preset = 1, behavior = 9, hpArc = 22, qiArc = 26, look = 6,
+local groups = { preset = 1, behavior = 9, hpArc = 23, qiArc = 26, look = 6,
   icons = 18, native = 5, advanced = 1 }
 local controls, defaults, requiredLang = {}, {}, { ['hud.name'] = true,
   ['hud.about'] = true, ['hud.dragTip'] = true, ['hud.DragIcons.run'] = true,
@@ -85,12 +99,12 @@ for _, group in ipairs(raw.groups) do
   end
 end
 check(next(groups) == nil and #raw.groups == 8, 'eight groups')
-check(n == 88 and actions == 2 and count(defaults) == 86, '88 controls, 86 values, two actions')
+check(n == 89 and actions == 2 and count(defaults) == 87, '89 controls, 87 values, two actions')
 
 local normalized, err = Schema.normalize(raw)
 check(normalized ~= nil, tostring(err))
 local defs, order = Schema.defs(normalized)
-check(#order == 86 and count(defs) == 86 and defs.DragIcons == nil and defs.BreakDemo == nil, 'framework value definitions')
+check(#order == 87 and count(defs) == 87 and defs.DragIcons == nil and defs.BreakDemo == nil, 'framework value definitions')
 for id, default in pairs(defaults) do
   check(equal(defs[id].default, default), 'normalize changed default: ' .. id)
   check(equal(Schema.clamp(defs[id], default), default), 'clamp changed default: ' .. id)
@@ -174,6 +188,7 @@ for _, p in ipairs({ 'Hp', 'Qi' }) do
   add(p .. 'TrackColor', 'color', '#0A0908', group, nil, nil, nil, nil, nil, enabled, true)
   add(p .. 'GhostColor', 'color', hp and '#8B1A1A' or '#AD8322', group, nil, nil, nil, nil, nil, p .. 'ShowGhost', true)
   add(p .. 'WarnColor', 'color', '#E0301E', group, nil, nil, nil, nil, nil, enabled, true)
+  if hp then add('HpVirtualColor', 'color', '#C8141E', group, nil, nil, nil, nil, nil, enabled, true) end
 end
 add('BreakHint', 'toggle', true, 'qiArc', nil, nil, nil, nil, nil, 'QiArcEnabled', true)
 add('QiBreakColor', 'color', '#FF3B30', 'qiArc', nil, nil, nil, nil, nil, 'BreakHint', true)
@@ -208,12 +223,12 @@ add('HudNumbers', 'toggle', true, 'native')
 add('HudNumberStyle', 'choice', 'center', 'native', nil, nil, nil, nil, 'center,side', 'HudNumbers', true)
 add('Debug', 'toggle', false, 'advanced')
 add('DragIcons', 'action', nil, 'icons')
-check(count(expected) == 88, 'all controls checked against table')
+check(count(expected) == 89, 'all controls checked against table')
 
 local iniText = read(Boot.CONFIG)
 local ini, iniOrder = Reader.parse(iniText)
-local S = Settings.new(assert(load(source, '@schema.lua', 't', {}))(), Boot.CONFIG)
-check(#iniOrder == 86 and count(ini) == 86 and count(S) == 86, 'ini keys exactly match schema')
+local S = Settings.new(loadSchema(), Boot.CONFIG)
+check(#iniOrder == 87 and count(ini) == 87 and count(S) == 87, 'ini keys exactly match schema')
 for id, default in pairs(defaults) do
   check(ini[id] ~= nil, 'ini missing: ' .. id)
   check(equal(S[id], default), 'settings template differs: ' .. id)
@@ -239,7 +254,7 @@ end
 check(#codes == 15 and codes[1] == 'zh-Hans' and codes[2] == 'en', 'framework language manifest')
 -- he 不在框架清单里但框架保留了译文文件，本模组同样保留并要求完整。
 codes[#codes + 1] = 'he'
-check(count(requiredLang) == 207, 'required language key count')
+check(count(requiredLang) == 209, 'required language key count')
 for _, code in ipairs(codes) do
   local dict = {}
   local text = read(langRoot .. code .. '.ini')
@@ -252,7 +267,7 @@ for _, code in ipairs(codes) do
   end
   for k in pairs(requiredLang) do check(dict[k] and dict[k] ~= '' and dict[k] ~= k, 'missing translation: ' .. code .. '/' .. k) end
   for k in pairs(dict) do check(requiredLang[k], 'unused language key: ' .. code .. '/' .. k) end
-  check(count(dict) == 207, 'language key count: ' .. code)
+  check(count(dict) == 209, 'language key count: ' .. code)
   for _, p in ipairs((code == 'en' or code == 'zh-Hans') and { 'Hp', 'Qi' } or {}) do
     local prefix = 'hud.' .. p .. 'FillDirection'
     check(dict[prefix .. '.normal'] == (code == 'en' and 'Normal' or '正向'), 'normal label')
@@ -285,7 +300,7 @@ withOpen(function(path, mode)
 end, function()
   local missing = Settings.new(normalized, 'missing.ini')
   for id, default in pairs(defaults) do check(equal(missing[id], default), 'missing file default: ' .. id) end
-  check(count(missing) == 86, 'missing file produces only schema values')
+  check(count(missing) == 87, 'missing file produces only schema values')
 end)
 check(missingOpens == 1, 'missing file never created')
 local payload = table.concat({
@@ -306,7 +321,7 @@ withOpen(function(_, mode)
   return { read = function(_, format) check(format == '*a', 'read entire ini'); return payload end,
     close = function() closed = closed + 1 end }
 end, function()
-  local custom = assert(load(source, '@schema.lua', 't', {}))()
+  local custom = loadSchema()
   custom.defaults = { FollowSmoothing = 0.20, PrivateValue = 7, PrivateFlag = true }
   local values = Settings.new(custom, 'fake.ini')
   check(values.FollowCharacter == false and values.FollowSmoothing == 0.27, 'Reader-style scalar decoding without grid snapping')
@@ -397,14 +412,20 @@ end, function()
   check(logger:write('one') and logger:write('two'), 'logger writes')
   check(#logOpens == 1 and logCloses == 0 and logFlushes == 2, 'resident log handle and immediate flush')
   logger.size = 2 * 1024 * 1024
-  check(logger:write('after truncation'), 'logger truncation write')
-  check(logOpens[2] == 'wb' and logCloses == 1 and not logText:find('one', 1, true), '2MB log truncated')
+  check(logger:write('past the limit'), 'logger writes past 2MB')
+  check(#logOpens == 1 and logCloses == 0 and logText:find('one', 1, true), 'no truncation mid-session')
   logger:close()
   logger:close()
-  check(logCloses == 2 and logger:write('closed') == false, 'logger close idempotent')
+  check(logCloses == 1 and logger:write('closed') == false, 'logger close idempotent')
   size = 2 * 1024 * 1024 + 1
   local large = Log.new('existing.log')
-  check(large:write('fresh') and logOpens[4] == 'wb', 'existing oversized log truncated')
+  check(large:write('fresh') and logOpens[2] == 'ab' and logOpens[3] == 'wb', 'oversized log truncated at launch')
+  check(not logText:find('one', 1, true), 'previous launch dropped')
+  -- 同一次启动里写失败后重开，不能再清空。
+  large.handle.write = function() return nil end
+  check(large:write('lost') == false and large.handle == nil, 'failed write releases handle')
+  size = 2 * 1024 * 1024 + 1
+  check(large:write('again') and logOpens[4] == 'ab' and #logOpens == 4, 'reopen mid-session keeps log')
   large:close()
 end)
 withOpen(function() return nil, 'unavailable' end, function()
@@ -413,5 +434,5 @@ withOpen(function() return nil, 'unavailable' end, function()
   logger:close()
 end)
 
-print('Schema: 88 controls / 86 ini keys / 2 actions / 8 groups / 12 drag coordinates')
+print('Schema: 89 controls / 87 ini keys / 2 actions / 8 groups / 12 drag coordinates')
 print('SCHEMA CHECKS PASSED: ' .. checks)

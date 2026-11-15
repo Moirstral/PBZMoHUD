@@ -59,6 +59,7 @@ function ArcStyle.resolve(S, key)
     trackOpacity = number(S[p .. 'TrackOpacity'], 0.45, 0, 1),
     ghostOpacity = number(S[p .. 'GhostOpacity'], 0.55, 0, 1),
     ghostColor = hex(S[p .. 'GhostColor'], key == 'hp' and '#8B1A1A' or '#AD8322'),
+    virtualColor = hex(S[p .. 'VirtualColor'], '#C8141E'),
     showGhost = toggle(S[p .. 'ShowGhost']),
     showTip = toggle(S[p .. 'ShowTip']),
     tipScale = number(S[p .. 'TipScale'], 1.8, 0.3, 3),
@@ -86,7 +87,7 @@ local kinds = {
   Radius = 'rebuild', Thickness = 'rebuild', ArcSpan = 'rebuild', Segments = 'rebuild',
   ArcSide = 'transform', Rotation = 'transform', OffsetX = 'transform', OffsetY = 'transform',
   Color = 'colour', TrackColor = 'colour', WarnColor = 'colour', BreakColor = 'colour',
-  BreakTrackColor = 'colour', GhostColor = 'colour',
+  BreakTrackColor = 'colour', GhostColor = 'colour', VirtualColor = 'colour',
 }
 
 function ArcStyle.changeKind(key)

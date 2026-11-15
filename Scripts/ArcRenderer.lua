@@ -81,6 +81,13 @@ local function segmentGeometry(style, i, brushScale)
   }, style.thickness * taper * brushScale
 end
 
+-- 笔触叠得很长，两端各伸出 reach（比例坐标）。0~100% 铺满整条笔触，
+-- 满值和空值才与底轨对齐，笔锋也正好落在真实数值上。
+local FULL = 0.9999
+local function front(bar, ratio)
+  return -bar.reach + ratio * (1 + 2 * bar.reach)
+end
+
 function Render.new(settings, log)
   local write = log or function() end
   return setmetatable({
@@ -170,19 +177,44 @@ function Render:createSegment(tree, parent, brush, colour, geom, thickness, z)
     pcall(function() widget:RemoveFromParent() end)
     return nil
   end
-  return { widget = widget, slot = slot, visible = true, alpha = 1, color = colour }
+  return { widget = widget, slot = slot, visible = true, alpha = 1, color = colour,
+    thickness = thickness, cutX = geom.x, cutY = geom.y, cutLength = geom.length }
+end
+
+-- 把一段笔触裁进 [lo, hi]（填充方向上的比例坐标）：只沿笔触方向改长度和位置，
+-- 角度不动，超出笔锋的那截尾迹就被切掉了。
+function Render:clipSegment(bar, seg, layer, c, lo, hi)
+  local geom, arcLen = seg.geom, bar.arcLen
+  local half = geom.length / 2 / arcLen
+  local a, b = math.max(c - half, lo), math.min(c + half, hi)
+  local length = (b - a) * arcLen
+  if length < 0.5 then
+    self:setVisible(layer, false)
+    return
+  end
+  local x, y = geom.x, geom.y
+  if a > c - half or b < c + half then
+    local shift = ((a + b) / 2 - c) * arcLen * bar.axisSign
+    local rad = math.rad(geom.rotation)
+    x, y = x + math.cos(rad) * shift, y + math.sin(rad) * shift
+  else
+    length = geom.length
+  end
+  if math.abs(layer.cutX - x) > 0.05 or math.abs(layer.cutY - y) > 0.05 then
+    layer.cutX, layer.cutY = x, y
+    pcall(function() layer.slot:SetPosition({ X = x, Y = y }) end)
+  end
+  if math.abs(layer.cutLength - length) > 0.05 then
+    layer.cutLength = length
+    pcall(function() layer.slot:SetSize({ X = length, Y = layer.thickness }) end)
+  end
+  self:setVisible(layer, true)
 end
 
 function Render:setVisible(segment, visible)
   if segment.visible == visible then return end
   segment.visible = visible
   pcall(function() segment.widget:SetVisibility(visible and VIS.HitTestInvisible or VIS.Collapsed) end)
-end
-
-function Render:setAlpha(segment, alpha)
-  if math.abs((segment.alpha or 1) - alpha) < 0.01 then return end
-  segment.alpha = alpha
-  pcall(function() segment.widget:SetRenderOpacity(alpha) end)
 end
 
 function Render:setSegmentColor(segment, colour)
@@ -201,8 +233,16 @@ function Render:createBar(tree, group, name, style)
   local fill = newCanvas(tree, name .. '_fill')
   local trackSlot = addChild(wrapper, track, 0, 0, radius * 2, radius * 2, 0)
   local ghostSlot = addChild(wrapper, ghost, 0, 0, radius * 2, radius * 2, 1)
-  local fillSlot = addChild(wrapper, fill, 0, 0, radius * 2, radius * 2, 2)
+  local fillSlot = addChild(wrapper, fill, 0, 0, radius * 2, radius * 2, 3)
   if not (valid(trackSlot) and valid(ghostSlot) and valid(fillSlot)) then return nil end
+  -- 临时损血只有血量有：受击后还没真正扣掉的那一截，接在填充末端。
+  local virtual, virtualSlot
+  if name == 'HP' then
+    virtual = newCanvas(tree, name .. '_virtual')
+    virtualSlot = addChild(wrapper, virtual, 0, 0, radius * 2, radius * 2, 2)
+    if not valid(virtualSlot) then return nil end
+    virtual:SetVisibility(VIS.HitTestInvisible)
+  end
   track:SetVisibility(VIS.HitTestInvisible)
   ghost:SetVisibility(VIS.HitTestInvisible)
   fill:SetVisibility(VIS.HitTestInvisible)
@@ -211,14 +251,19 @@ function Render:createBar(tree, group, name, style)
   local base = Colors.hexToLinear(style.color)
   local trackColour = Colors.hexToLinear(style.trackColor)
   local ghostColour = Colors.hexToLinear(style.ghostColor)
+  local virtualColour = Colors.hexToLinear(style.virtualColor)
+  local arcLen = math.rad(style.span) * style.radius
   local bar = {
     name = name, key = name == 'HP' and 'hp' or 'qi', style = style, side = style.side,
     wrapper = wrapper, wrapperSlot = wrapperSlot,
-    track = track, ghost = ghost, fill = fill,
-    trackSlot = trackSlot, ghostSlot = ghostSlot, fillSlot = fillSlot,
+    track = track, ghost = ghost, fill = fill, virtual = virtual,
+    trackSlot = trackSlot, ghostSlot = ghostSlot, fillSlot = fillSlot, virtualSlot = virtualSlot,
     segments = {}, trackSegments = {}, ghostSegments = {},
     enabled = style.enabled, tipVisible = false, warn = false, breakActive = false, fade = 1,
     colourKey = style.color, trackColourKey = style.trackColor, ghostColourKey = style.ghostColor,
+    virtualColourKey = style.virtualColor,
+    arcLen = arcLen,
+    reach = math.max(6, arcLen / (style.segments - 1) * style.strokeOverlap) / 2 / arcLen,
   }
   bar.startAngle, bar.endAngle = angles(style)
   for i = 1, style.segments do
@@ -231,6 +276,12 @@ function Render:createBar(tree, group, name, style)
     bar.trackSegments[i], bar.ghostSegments[i] = trackSeg, ghostSeg
     self:setVisible(ghostSeg, false)
     self:setVisible(fillSeg, false)
+    if virtual then
+      local virtualSeg = self:createSegment(tree, virtual, self.brush, virtualColour, geom, math.max(2, thickness), 1)
+      if not virtualSeg then return nil end
+      bar.segments[i].virtual = virtualSeg
+      self:setVisible(virtualSeg, false)
+    end
   end
 
   -- 预建隐藏笔锋，ShowTip 切换不重建控件树。
@@ -350,22 +401,26 @@ function Render:applyBarColours(bar)
   local ghostKey = bar.breakActive and ('break' .. style.breakColor) or style.ghostColor
   local fillChanged, trackChanged = bar.colourKey ~= key, bar.trackColourKey ~= trackKey
   local ghostChanged = bar.ghostColourKey ~= ghostKey
-  if not fillChanged and not trackChanged and not ghostChanged then return end
+  local virtualChanged = bar.virtual ~= nil and bar.virtualColourKey ~= style.virtualColor
+  if not fillChanged and not trackChanged and not ghostChanged and not virtualChanged then return end
   local fill = fillChanged and Colors.hexToLinear(key)
   local ghost = ghostChanged and (bar.breakActive
     and Colors.lighten(Colors.hexToLinear(style.breakColor), GHOST_DARKEN)
     or Colors.hexToLinear(style.ghostColor))
   local track = trackChanged and Colors.hexToLinear(trackKey)
+  local virtual = virtualChanged and Colors.hexToLinear(style.virtualColor)
   for _, seg in ipairs(bar.segments) do
     if fillChanged then self:setSegmentColor(seg.fill, fill) end
     if ghostChanged then self:setSegmentColor(seg.ghost, ghost) end
     if trackChanged then self:setSegmentColor(seg.track, track) end
+    if virtualChanged then self:setSegmentColor(seg.virtual, virtual) end
   end
   if fillChanged and bar.tip then
     bar.tip.colour = Colors.lighten(fill, 1.55)
     setWidgetColor(bar.tip.widget, bar.tip.colour)
   end
   bar.colourKey, bar.trackColourKey, bar.ghostColourKey = key, trackKey, ghostKey
+  if virtualChanged then bar.virtualColourKey = style.virtualColor end
 end
 
 function Render:applySide(bar)
@@ -376,9 +431,10 @@ function Render:applySide(bar)
   for i, seg in ipairs(bar.segments) do
     local geom = segmentGeometry(style, i, valid(self.material) and 2.4 or 1)
     seg.geom = geom
-    for _, layer in ipairs({ seg.track, seg.ghost, seg.fill }) do
+    for _, layer in ipairs({ seg.track, seg.ghost, seg.fill, seg.virtual }) do
       layer.slot:SetPosition({ X = geom.x, Y = geom.y })
       layer.widget:SetRenderTransformAngle(geom.rotation)
+      layer.cutX, layer.cutY = geom.x, geom.y
     end
   end
   if bar.ratio ~= nil then self:updateTip(bar, bar.ratio) end
@@ -472,7 +528,8 @@ function Render:updateTip(bar, ratio)
     end
     return
   end
-  local tipRatio = style.fillDirection == 'reverse' and (1 - ratio) or ratio
+  local u = front(bar, ratio)
+  local tipRatio = style.fillDirection == 'reverse' and (1 - u) or u
   local angle = bar.startAngle + (bar.endAngle - bar.startAngle) * tipRatio
   local radius = style.radius
   local x = radius + math.cos(angle) * radius
@@ -502,7 +559,7 @@ function Render:updateTip(bar, ratio)
   end
 end
 
-function Render:updateBar(bar, ratio, ghost, dt, breakActive)
+function Render:updateBar(bar, ratio, ghost, dt, breakActive, virtual)
   if not bar.style.enabled then self:setBarEnabled(bar, false); return end
   local N, style = #bar.segments, bar.style
   if not ratio or N == 0 then
@@ -531,32 +588,33 @@ function Render:updateBar(bar, ratio, ghost, dt, breakActive)
   bar.breakActive = bar.key == 'qi' and breakActive == true
   self:applyBarColours(bar)
   local reverse = style.fillDirection == 'reverse'
+  bar.axisSign = ((bar.endAngle > bar.startAngle) and 1 or -1) * (reverse and -1 or 1)
 
-  local filled = ratio * N
-  local fillCount = math.floor(filled)
-  local fillFrac = filled - fillCount
-  if fillCount >= N then fillCount, fillFrac = N, 0 end
-  local ghostFilled = ghost * N
-  local ghostCount = math.floor(ghostFilled)
-  local ghostFrac = ghostFilled - ghostCount
-  if ghostCount >= N then ghostCount, ghostFrac = N, 0 end
-
+  -- 三层各占一段、互不重叠：填充到实血，临时损血接到当前血量，残影接到掉血前。
+  -- 叠在一起的话，水墨笔刷的半透明边会让下层的颜色透上来，把整条染色。
+  virtual = (bar.virtual ~= nil) and math.max(0, math.min(ratio, virtual or 0)) or 0
+  local solid = ratio - virtual
+  local solidAt = front(bar, solid)
+  local solidEnd = solid >= FULL and math.huge or solidAt
+  local frontAt = front(bar, ratio)
+  local frontEnd = ratio >= FULL and math.huge or frontAt
+  local ghostEnd = ghost >= FULL and math.huge or front(bar, ghost)
+  local hasVirtual = virtual > 0.0005
   for i = 1, N do
-    local idx = reverse and (N + 1 - i) or i
-    local visible = i <= fillCount or (i == fillCount + 1 and fillFrac > 0.002)
-    self:setVisible(bar.segments[idx].fill, visible)
-    local alpha = (i == fillCount + 1) and fillFrac or 1
-    self:setAlpha(bar.segments[idx].fill, visible and alpha or 0)
+    local seg = bar.segments[reverse and (N + 1 - i) or i]
+    local c = (i - 1) / (N - 1)
+    self:clipSegment(bar, seg, seg.fill, c, -math.huge, solidEnd)
+    if hasVirtual then self:clipSegment(bar, seg, seg.virtual, c, solidAt, frontEnd) end
+    if style.showGhost then self:clipSegment(bar, seg, seg.ghost, c, frontAt, ghostEnd) end
+  end
+  if hasVirtual then
+    bar.virtualShown = true
+  elseif bar.virtualShown then
+    bar.virtualShown = false
+    for i = 1, N do self:setVisible(bar.segments[i].virtual, false) end
   end
   if style.showGhost then
     bar.ghostShown = true
-    for i = 1, N do
-      local idx = reverse and (N + 1 - i) or i
-      local visible = i <= ghostCount or (i == ghostCount + 1 and ghostFrac > 0.002)
-      self:setVisible(bar.segments[idx].ghost, visible)
-      local alpha = (i == ghostCount + 1) and ghostFrac or 1
-      self:setAlpha(bar.segments[idx].ghost, visible and alpha or 0)
-    end
   elseif bar.ghostShown ~= false then
     -- 残影只隐藏一次；开关关掉之后就没有需要再更新的东西了。
     bar.ghostShown = false
@@ -575,6 +633,10 @@ function Render:updateBar(bar, ratio, ghost, dt, breakActive)
   if bar.lastFillOpacity == nil or math.abs(bar.lastFillOpacity - fillOpacity) > 0.005 then
     bar.lastFillOpacity = fillOpacity
     pcall(function() bar.fill:SetRenderOpacity(fillOpacity) end)
+  end
+  if bar.virtual and (bar.lastVirtualOpacity == nil or math.abs(bar.lastVirtualOpacity - fillOpacity) > 0.005) then
+    bar.lastVirtualOpacity = fillOpacity
+    pcall(function() bar.virtual:SetRenderOpacity(fillOpacity) end)
   end
   if bar.lastGhostOpacity == nil or math.abs(bar.lastGhostOpacity - ghostOpacity) > 0.005 then
     bar.lastGhostOpacity = ghostOpacity
@@ -595,6 +657,10 @@ function Render:clearBarOpacity(bar)
   if bar.lastFillOpacity ~= 0 then
     bar.lastFillOpacity = 0
     pcall(function() bar.fill:SetRenderOpacity(0) end)
+  end
+  if bar.virtual and bar.lastVirtualOpacity ~= 0 then
+    bar.lastVirtualOpacity = 0
+    pcall(function() bar.virtual:SetRenderOpacity(0) end)
   end
   if bar.lastGhostOpacity ~= 0 then
     bar.lastGhostOpacity = 0
@@ -672,7 +738,8 @@ function Render:update(snapshot, dt, breakActive)
       local value, maximum = snapshot[bar.key], snapshot[bar.key .. 'Max']
       if value and maximum and maximum > 0 then
         local ratio = math.max(0, math.min(1, value / maximum))
-        self:updateBar(bar, ratio, self:ghostRatio(bar, ratio, dt), dt, breakActive)
+        local virtual = (snapshot[bar.key .. 'Virtual'] or 0) / maximum
+        self:updateBar(bar, ratio, self:ghostRatio(bar, ratio, dt), dt, breakActive, virtual)
       else self:setBarEnabled(bar, false) end
     end
   end

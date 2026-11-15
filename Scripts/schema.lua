@@ -47,6 +47,7 @@ return {
       { id = 'HpShowGhost', type = 'toggle', label = 'hud.HpShowGhost', tip = 'hud.HpShowGhost.tip', default = true, effect = 'immediate', enabledWhen = { key = 'HpArcEnabled', eq = true } },
       { id = 'HpGhostOpacity', type = 'slider', label = 'hud.HpGhostOpacity', tip = 'hud.HpGhostOpacity.tip', default = 0.55, min = 0, max = 1, step = 0.05, effect = 'immediate', enabledWhen = { key = 'HpArcEnabled', eq = true } },
       { id = 'HpGhostColor', type = 'color', label = 'hud.HpGhostColor', tip = 'hud.HpGhostColor.tip', default = '#8B1A1A', effect = 'immediate', enabledWhen = { key = 'HpShowGhost', eq = true } },
+      { id = 'HpVirtualColor', type = 'color', label = 'hud.HpVirtualColor', tip = 'hud.HpVirtualColor.tip', default = '#C8141E', effect = 'immediate', enabledWhen = { key = 'HpArcEnabled', eq = true } },
       { id = 'HpShowTip', type = 'toggle', label = 'hud.HpShowTip', tip = 'hud.HpShowTip.tip', default = true, effect = 'immediate', enabledWhen = { key = 'HpArcEnabled', eq = true } },
       { id = 'HpTipScale', type = 'slider', label = 'hud.HpTipScale', tip = 'hud.HpTipScale.tip', default = 1.80, min = 0.3, max = 3, step = 0.05, effect = 'immediate', enabledWhen = { key = 'HpArcEnabled', eq = true } },
       { id = 'HpTipAngle', type = 'slider', label = 'hud.HpTipAngle', tip = 'hud.HpTipAngle.tip', default = -15, min = -90, max = 90, step = 1, unit = '°', effect = 'immediate', enabledWhen = { key = 'HpArcEnabled', eq = true } },

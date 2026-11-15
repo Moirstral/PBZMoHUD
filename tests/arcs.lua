@@ -203,7 +203,8 @@ for _, write in ipairs(writes) do
   eq(write.object == r.group or write.object == hp.wrapper or write.object == qi.wrapper, true, 'only wrappers/group transform')
 end
 for _, bar in ipairs({ hp, qi }) do
-  local a = bar.startAngle + (bar.endAngle - bar.startAngle) * bar.ratio
+  local u = -bar.reach + bar.ratio * (1 + 2 * bar.reach)
+  local a = bar.startAngle + (bar.endAngle - bar.startAngle) * u
   local dx, dy = Style.point(bar.style, math.deg(a), bar.style.radius)
   local rad = math.rad(bar.style.rotation)
   local lx, ly = bar.tipX - bar.style.radius, bar.tipY - bar.style.radius
@@ -214,30 +215,73 @@ local dx, dy = Style.point(Style.resolve({ HpRotation = 90, HpOffsetY = 40 }, 'h
 near(dx, 0); near(dy, -155)
 reset(); r:applyTransforms(); eq(count(), 0, 'transform cache')
 
--- reverse 仅映射 fill/ghost 段与 tip ratio，部分段 alpha 也要反向。
+-- 笔触裁剪：每层只画自己那一截，填充末端正好停在笔锋，不再伸出尾迹。
+-- 比例坐标由测试独立换算：段中心 c、笔触沿切线方向，正方向随填充方向翻转。
+local function frontOf(bar, ratio) return -bar.reach + ratio * (1 + 2 * bar.reach) end
+local function pieceOf(bar, i, layer)
+  local seg, N = bar.segments[i], #bar.segments
+  local reverse = bar.style.fillDirection == 'reverse'
+  local t = (i - 1) / (N - 1)
+  local c = reverse and (1 - t) or t
+  local s = ((bar.endAngle > bar.startAngle) and 1 or -1) * (reverse and -1 or 1)
+  local dx, dy = -math.sin(seg.geom.angle) * s, math.cos(seg.geom.angle) * s
+  local along = ((layer.cutX - seg.geom.x) * dx + (layer.cutY - seg.geom.y) * dy) / bar.arcLen
+  local half = layer.cutLength / 2 / bar.arcLen
+  return c + along - half, c + along + half, c, seg.geom.length / 2 / bar.arcLen
+end
+local function expectPiece(bar, layerName, lo, hi, message)
+  for i, seg in ipairs(bar.segments) do
+    local layer = seg[layerName]
+    local _, _, c, half = pieceOf(bar, i, layer)
+    local a, b = math.max(c - half, lo), math.min(c + half, hi)
+    local shown = (b - a) * bar.arcLen >= 0.5
+    eq(layer.visible, shown, message .. ' visible ' .. i)
+    if shown then
+      local pa, pb = pieceOf(bar, i, layer)
+      checks = checks + 1
+      assert(math.abs(pa - a) * bar.arcLen < 0.2 and math.abs(pb - b) * bar.arcLen < 0.2,
+        message .. ' piece ' .. i .. ': ' .. pa .. '..' .. pb .. ' ~= ' .. a .. '..' .. b)
+    end
+  end
+end
+local function tipAt(bar, u)
+  local tipRatio = bar.style.fillDirection == 'reverse' and (1 - u) or u
+  local a = bar.startAngle + (bar.endAngle - bar.startAngle) * tipRatio
+  near(bar.tipX, bar.style.radius + math.cos(a) * bar.style.radius, 'tip x')
+  near(bar.tipY, bar.style.radius + math.sin(a) * bar.style.radius, 'tip y')
+end
 local D = { HpSegments = 8, QiSegments = 8, HpRotation = 90, QiArcEnabled = false, WarnThresholdHp = 0 }
 local d = build(D)
 local b, dtotal = d.hpBar, constructed
+eq(b.virtual.parent, b.wrapper, 'hp has a temp damage layer'); eq(d.qiBar.virtual, nil, 'qi has no temp damage layer')
+eq(d.qiBar.segments[1].virtual, nil)
 b.ghostRatio = 0.5625
 d:update(snapshot(31.25, 50), 0)
-for i, seg in ipairs(b.segments) do
-  eq(seg.fill.visible, i <= 3); eq(seg.ghost.visible, i <= 5)
-end
-near(b.segments[3].fill.alpha, 0.5); near(b.segments[5].ghost.alpha, 0.5)
+local huge = math.huge
+-- 残影只画填充与残影之间那一截，填充底下不留残影。
+expectPiece(b, 'fill', -huge, frontOf(b, 0.3125), 'normal fill')
+expectPiece(b, 'ghost', frontOf(b, 0.3125), frontOf(b, 0.5625), 'normal ghost')
+for _, seg in ipairs(b.segments) do eq(seg.virtual.visible, false, 'no temp damage') end
+tipAt(b, frontOf(b, 0.3125))
 local normalTipY = b.tipY
 local geoms = {}
 for i, seg in ipairs(b.segments) do geoms[i] = seg.geom end
 D.HpFillDirection = 'reverse'
 d:update(snapshot(31.25, 50), 0)
 eq(constructed, dtotal)
-for i, seg in ipairs(b.segments) do
-  eq(seg.geom, geoms[i]); eq(seg.fill.visible, i >= 6); eq(seg.ghost.visible, i >= 4)
-end
-near(b.segments[6].fill.alpha, 0.5); near(b.segments[4].ghost.alpha, 0.5)
+for i, seg in ipairs(b.segments) do eq(seg.geom, geoms[i]) end
+expectPiece(b, 'fill', -huge, frontOf(b, 0.3125), 'reverse fill')
+expectPiece(b, 'ghost', frontOf(b, 0.3125), frontOf(b, 0.5625), 'reverse ghost')
+eq(b.segments[1].fill.visible, false, 'reverse starts from the far end')
+eq(b.segments[#b.segments].fill.visible, true, 'reverse fills the near end')
+-- 没有掉血时残影一段都不画。
+b.ghostRatio = nil; D.HpFillDirection = 'normal'
+d:update(snapshot(31.25, 50), 0)
+for _, seg in ipairs(b.segments) do eq(seg.ghost.visible, false) end
+b.ghostRatio = 0.5625; D.HpFillDirection = 'reverse'
+d:update(snapshot(31.25, 50), 0)
 near(b.tipY, 2 * b.style.radius - normalTipY)
-local a = b.startAngle + (b.endAngle - b.startAngle) * (1 - 0.3125)
-near(b.tipX, b.style.radius + math.cos(a) * b.style.radius)
-near(b.tipY, b.style.radius + math.sin(a) * b.style.radius)
+tipAt(b, frontOf(b, 0.3125))
 D.HpFillDirection = 'normal'; d:update(snapshot(31.25, 50), 0); near(b.tipY, normalTipY)
 D.HpShowGhost, D.HpShowTip = false, false
 d:update(snapshot(31.25, 50), 0)
@@ -247,6 +291,50 @@ reset(); d:update(snapshot(31.25, 50), 0); eq(count(), 0)
 D.HpShowGhost, D.HpShowTip, D.HpTipScale, D.HpTipAngle = true, true, 2.2, 25
 d:update(snapshot(31.25, 50), 0); eq(b.tipVisible, true); eq(constructed, dtotal)
 near(b.tipSize, 12 * 2.1 * 2.2)
+
+-- 临时损血：填充只到扣完后的血量，红色那截接到当前血量，笔锋停在红色末端（还没扣）。
+b.ghostRatio = nil
+local function virtualSnap(hpValue, virtual) local s = snapshot(hpValue, 50); s.hpVirtual = virtual; return s end
+d:update(virtualSnap(62.5, 25), 0)
+expectPiece(b, 'fill', -huge, frontOf(b, 0.375), 'fill stops at solid hp')
+expectPiece(b, 'virtual', frontOf(b, 0.375), frontOf(b, 0.625), 'temp damage piece')
+for _, seg in ipairs(b.segments) do eq(seg.ghost.visible, false, 'temp damage is not a ghost') end
+tipAt(b, frontOf(b, 0.625))
+colour(b.segments[1].virtual.color, Colors.hexToLinear('#C8141E'), 'temp damage blood red by default')
+near(b.virtual.SetRenderOpacityValue, b.lastFillOpacity, 'temp damage follows fill opacity')
+-- 损血超过当前血量也只画到当前血量为止。
+d:update(virtualSnap(20, 60), 0)
+expectPiece(b, 'fill', -huge, frontOf(b, 0), 'all hp pending')
+expectPiece(b, 'virtual', frontOf(b, 0), frontOf(b, 0.2), 'clamped temp damage')
+-- 到时间真正扣掉：红色清空。
+d:update(virtualSnap(37.5, 0), 0)
+for _, seg in ipairs(b.segments) do eq(seg.virtual.visible, false, 'temp damage cleared') end
+reset(); d:update(virtualSnap(37.5, 0), 0); eq(count(), 0, 'cleared temp damage writes nothing')
+-- 满值用整段笔触，和底轨对齐；满血带临时损血时红色一直画到底轨末端。
+d:update(virtualSnap(100, 0), 0)
+for _, seg in ipairs(b.segments) do
+  eq(seg.fill.visible, true); near(seg.fill.cutLength, seg.geom.length, 'full uses whole strokes')
+  near(seg.fill.cutX, seg.geom.x); near(seg.fill.cutY, seg.geom.y)
+end
+eq(b.tipVisible, false)
+d:update(virtualSnap(100, 10), 0)
+expectPiece(b, 'virtual', frontOf(b, 0.9), huge, 'full hp temp damage')
+local _, farEnd = pieceOf(b, #b.segments, b.segments[#b.segments].virtual)
+near(farEnd, 1 + b.reach, 'temp damage reaches track end')
+-- 空值不留任何填充，笔锋落在底轨起点。
+d:update(virtualSnap(0, 0), 0)
+for _, seg in ipairs(b.segments) do eq(seg.fill.visible, false, 'empty') end
+tipAt(b, -b.reach)
+D.HpVirtualColor = '#00FF00'; reset(); d:applyColours()
+colour(b.segments[1].virtual.color, Colors.hexToLinear('#00FF00'))
+eq(count(b, colorWrite), #b.segments, 'temp damage-only repaint')
+eq(Style.changeKind('HpVirtualColor'), 'colour')
+d:update(virtualSnap(62.5, 25), 0)
+d:setBarShown('hp', false)
+for _ = 1, 120 do d:update(virtualSnap(62.5, 25), 0.016) end
+eq(b.virtual.SetRenderOpacityValue, 0, 'faded bar temp damage written to zero')
+d:setBarShown('hp', true)
+for _ = 1, 120 do d:update(virtualSnap(62.5, 0), 0.016) end
 
 -- 禁用一次只折叠 wrapper，之后连段数组和快照都不能读取。
 D.HpArcEnabled = false

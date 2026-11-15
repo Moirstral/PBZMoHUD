@@ -79,6 +79,7 @@ python PBZMoHUD/install_to_game.py --apply --sync
 - `HpTrackOpacity=0.45`、`QiTrackOpacity=0.45`：底轨透明度，0..1。
 - `HpGhostOpacity=0.55`、`QiGhostOpacity=0.55`：残影透明度，0..1。
 - `HpGhostColor=#8B1A1A`、`QiGhostColor=#AD8322`：残影颜色，默认血量暗红、杀气暗金；破防期间杀气残影跟随破防颜色。
+- `HpVirtualColor=#C8141E`：临时损血颜色。斩马刀受击后尚未真正扣除的血量接在血量填充末端显示，笔锋停在它的末端。
 - `HpShowGhost=true`、`QiShowGhost=true`：显示损失残影。
 - `HpShowTip=true`、`QiShowTip=true`：显示笔锋。
 - `HpTipScale=1.8`、`QiTipScale=1.8`：笔锋尺寸倍率，0.3..3。

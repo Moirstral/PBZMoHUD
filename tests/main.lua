@@ -63,9 +63,11 @@ RegisterKeyBind = function(k, cb) binds[k] = cb end
 local capturedS, renderCalls, iconsCtx, barsCalls, renderUpdate = nil, {}, nil, 0, nil
 local barsWakes = {}
 local iconsStub
+local virtualHp = 0
 package.preload['Stats'] = function()
   return { new = function()
     return { read = function() return { pc = pc, pawn = pawn, hp = 100, hpMax = 200, qi = 50, qiMax = 100, ult = 10, ultMax = 100 } end,
+      readVirtual = function() return virtualHp end,
       forget = function() end }
   end }
 end
@@ -144,6 +146,12 @@ shared[key('panel', 'PBZMoHUD')] = 'open'
 frames(2)
 ok(iconsCtx and iconsCtx.configVisible, 'configVisible forwarded')
 eq(iconsCtx.hudFade, 1, 'panel overrides fade')
+virtualHp = 30
+frames(1)
+eq(renderUpdate.snap.hpVirtual, 30, 'temp HP damage reaches the renderer')
+virtualHp = 0
+frames(1)
+eq(renderUpdate.snap.hpVirtual, 0, 'temp HP damage clears')
 
 -- 改半径只触发延迟重建，改旋转只触发 transform。
 shared[key('seq', 'PBZMoHUD')] = 2

@@ -757,7 +757,11 @@ local function step(dt)
 
   local hpRatio, qiRatio, ultRatio
   if snapshot then
-    if snapshot.hpMax and snapshot.hpMax > 0 then hpRatio = snapshot.hp / snapshot.hpMax end
+    -- 临时损血还没真正扣：弧线把它画成填充末端的一截，满血隐藏按扣完之后的血量算。
+    snapshot.hpVirtual = heavyReady and stats:readVirtual(now, snapshot.pawn) or 0
+    if snapshot.hpMax and snapshot.hpMax > 0 then
+      hpRatio = math.max(0, snapshot.hp - snapshot.hpVirtual) / snapshot.hpMax
+    end
     if snapshot.qiMax and snapshot.qiMax > 0 then qiRatio = snapshot.qi / snapshot.qiMax end
     if snapshot.ult and snapshot.ultMax and snapshot.ultMax > 0 then
       ultRatio = snapshot.ult / snapshot.ultMax
@@ -871,6 +875,7 @@ local function step(dt)
     releaseDragInput(reader:panel())
   end
   local breakActive = breakWatch:update(snapshot and snapshot.pawn, now, heavyReady)
+  if S.Debug and heavyReady and snapshot then pcall(stats.probeCharges, stats, now, log) end
 
   if heavyReady then
     local iconsOk, iconsErr = pcall(function()
