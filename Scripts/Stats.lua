@@ -189,6 +189,9 @@ function Stats:forget()
   self._pc, self._pawn, self._set, self._names = nil, nil, nil, nil
   self._hp, self._hpMax, self._qi, self._qiMax = nil, nil, nil, nil
   self._ult, self._ultMax = nil, nil
+  -- 模块级缓存同样是旧世界的 UObject 引用，换图后必须重查，
+  -- 否则 engine() 会对已销毁的对象调 IsValid()。
+  ENGINE, ASC_CLASS = nil, nil
 end
 
 return Stats

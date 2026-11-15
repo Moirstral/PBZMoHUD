@@ -2,6 +2,13 @@
 -- 闭包提为模块级具名函数，避免每次调用都新建一个匿名函数再 pcall。
 local Util = {}
 
+-- 换图窗口里 UE4SS 返回的 UObject 属性包装值可能已经指向销毁中的对象。
+-- 解引用（:get()）与读属性都会落到 native 层，Lua 的 pcall 挡不住那里的
+-- 野指针访问；这段时间由主循环关掉反射，调用方拿到 nil 走自己的空值分支。
+local mapGuard = false
+function Util.setMapGuard(on) mapGuard = on and true or false end
+function Util.mapGuard() return mapGuard end
+
 local function rawIsValid(object) return object:IsValid() end
 function Util.valid(object)
   if object == nil then return false end
@@ -11,6 +18,7 @@ end
 
 local function rawGet(object, name) return object[name] end
 function Util.prop(object, name)
+  if mapGuard then return nil end
   local ok, value = pcall(rawGet, object, name)
   if ok then return value end
   return nil
@@ -37,7 +45,7 @@ end
 
 local function rawGetInner(value) return value:get() end
 function Util.unwrap(value)
-  if value == nil then return nil end
+  if value == nil or mapGuard then return nil end
   local ok, inner = pcall(rawGetInner, value)
   if ok and inner ~= nil then return inner end
   return value
@@ -56,6 +64,9 @@ function Util.cls(path)
   if Util.valid(object) then classCache[path] = object end
   return object
 end
+
+-- 换图时把静态类 userdata 一并作废，下一次取用重新 StaticFindObject。
+function Util.forgetClasses() classCache = {} end
 
 -- UMG 的 ESlateVisibility 枚举与视口 Z 序常量（第 16 项）。
 -- Visible=0 / Collapsed=1 / Hidden=2 / HitTestInvisible=3 / SelfHitTestInvisible=4

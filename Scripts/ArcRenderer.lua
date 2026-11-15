@@ -254,8 +254,8 @@ end
 
 function Render:build()
   self:destroy()
-  self:cleanupOld(nil)
-
+  -- 全局 UserWidget 清理由 main 在加载时做一次；换世界重建时不再遍历，
+  -- 避免在旧对象回收窗口里对列表项做反射。
   local engine = FindFirstOf('GameEngine') or FindFirstOf('Engine')
   if not valid(engine) then return false, 'GameEngine is not ready' end
   local gi = engine.GameInstance
@@ -313,6 +313,18 @@ function Render:destroy()
   if self.root ~= nil and valid(self.root) then
     pcall(function() self.root:RemoveFromParent() end)
   end
+  self.root, self.tree, self.canvas, self.group, self.groupSlot = nil, nil, nil, nil, nil
+  self.hpBar, self.qiBar, self.center, self.uiScale = nil, nil, nil, nil
+  self.bars = {}
+  self.anchorX, self.anchorY = nil, nil
+  self.master = nil
+  self.barShown = { hp = true, qi = true }
+end
+
+-- 换世界时只作废 Lua 侧的控件引用，不调用任何 UMG 方法。旧控件可能已经随
+-- 旧世界销毁，连 IsValid() 都会走 UE4SS 反射；引用丢掉后下一次 build()
+-- 会新建一整套控件，不会再拿旧对象做 ProcessEvent。
+function Render:forget()
   self.root, self.tree, self.canvas, self.group, self.groupSlot = nil, nil, nil, nil, nil
   self.hpBar, self.qiBar, self.center, self.uiScale = nil, nil, nil, nil
   self.bars = {}

@@ -599,7 +599,7 @@ end
 
 -- 换世界时调用：把「从游戏里拿到的」引用全部丢掉（它们属于旧世界），并让下一次
 -- update 立刻重新扫描。这里只改 Lua 字段，不调用任何 UMG 函数 —— 旧控件可能正在
--- 被销毁，这时候去碰它就是踩野指针（实测就是换图后一两秒崩在 UE4SS 里）。
+-- 被销毁，这时候去碰它就是踩野指针。
 function Icons:forget()
   self.quickslot, self.weapon = nil, nil
   self.bulletNum = nil
@@ -609,6 +609,19 @@ function Icons:forget()
   self.dragTipVisible = false
   self.dimPainted = nil
   cachedPC = nil
+end
+
+-- 换世界时额外作废 MOD 自建控件的 Lua 引用。UE4SS 的 UObject userdata 在
+-- 世界切换后可能已经失效，复用它们做 IsValid() / SetVisibility() 就是野指针。
+-- 下一次 update 会重新 build() 一整套控件；拖动遮罩由 syncDim() 按需重建。
+function Icons:forgetWidgets()
+  self.root, self.tree, self.canvas, self.layer = nil, nil, nil, nil
+  self.dragTip, self.tipPaintedText, self.tipPaintedVisible = nil, nil, nil
+  self.dimRoot, self.dimPainted = nil, nil
+  self.medEntries, self.ultEntries = {}, {}
+  self.scanAt, self.readAt, self.buildAt = -1, -1, 0
+  self.viewportAt, self.viewportCache = -1, nil
+  self.shownValue, self.shownOpacity, self.rootShown = nil, nil, nil
 end
 
 function Icons:scan()

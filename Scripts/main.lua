@@ -132,15 +132,19 @@ local hudPick = { tiers = { {}, {} }, count = 0, at = -HUD_RESCAN_GAP, ready = f
 local heavyReady, heavyHeld = true, false
 
 -- 换图冻结：比 HUD 探测更早、更硬的一道门。
--- 21:54 的崩溃 dump（UE4SS.dll+0xB0D556，读 0xFFFFFFFFFFFFFFFF）说明旧世界的
--- UObject 在 UEngine::LoadMap 的 PreHook 之前就已进入销毁流程；那一两帧里 step
--- 只要读一次游戏对象的属性就可能把野指针交给引擎，Lua 的 pcall 挡不住 native AV。
+-- 旧世界的 UObject 可能早于 UEngine::LoadMap 的 PreHook 就进入销毁流程；
+-- 那一两帧里 step 只要读一次游戏对象的属性就可能把野指针交给引擎，
+-- Lua 的 pcall 挡不住 native 层的访问违例。
 -- 所以游戏自己的 PreLoadMap 一到先短冻结，LoadMap PreHook 再转成长冻结，
--- 直到 PostHook + 沉降期结束。两条信号都失联时靠超时放行，绝不把 MOD 冻死。
--- 冻结期间 step 只收起 MOD 自己创建的控件（挂在视口，不随 world 销毁）：
--- 按键分发、菜单/图标轮询、统计采样、HUD 探测、原生条遍历全部停掉。
+-- 直到 PostHook + 沉降期 + 观察期结束。两条信号都失联时靠超时放行。
+-- 冻结期间 step 只做纯 Lua 记账，连 IsValid() 都不调用；
+-- 收屏、统计采样、HUD 探测、图标与原生条遍历全部延到观察期之后。
 local PRELOAD_HOLD = 1.5
+-- PostHook 之后旧世界的 UObject 仍在回收：沉降期结束再留一段观察期，
+-- 期间只读 Lua 状态，不碰任何游戏对象。
+local MAP_GUARD_EXTRA = 1.5
 local mapFreeze = { preUntil = 0, hard = false, at = 0, source = '' }
+local mapGuardUntil = 0
 
 local function clearHudPick()
   for t = 1, #hudPick.tiers do
@@ -461,17 +465,23 @@ end
 
 local RT = { alive = true, lastTick = os.time(), generation = 0, recovered = false }
 PBZMOHUD_RUNTIME = RT
+-- 热重载复用的是同一份 Util：先把上一次运行可能留下的闸门复位。
+Util.setMapGuard(false)
 
--- 冻结状态的三个入口全部只做纯 Lua 记账，绝不调用任何 UObject 方法：
--- 换图回调本身就是引擎在销毁旧对象时触发的，这时候连 IsValid() 都不可信。
--- 真正的收屏动作留给 step 的冻结分支，那里只碰 MOD 自己创建的控件。
+-- 换图回调只做纯 Lua 记账，绝不调用任何 UObject 方法：
+-- 引擎销毁旧对象时连 IsValid() 都不可信。旧控件引用在 onWorldTeardown
+-- 里整套作废，观察期结束后由 rebuild() 新建，不做任何收屏动作。
 local function releaseMapFreeze(source)
   if not RT.alive or not mapFreeze.hard then return end
   mapFreeze.hard = false
   hudPick.loading = false
   hudPick.settleAt = os.clock() + LOAD_SETTLE
+  mapGuardUntil = hudPick.settleAt + MAP_GUARD_EXTRA
   heavyReady, heavyHeld = false, false
   clearHudPick()
+  -- PostHook 之后引擎才真正释放旧世界的对象，缓存可能在冻结期间又被填上。
+  -- 再作废一次跨帧引用，避免观察期结束时重新拿到旧对象。
+  if RT.onWorldTeardown then RT.onWorldTeardown() end
   alert('map load: released (' .. source .. ')')
 end
 
@@ -479,17 +489,23 @@ local function holdMapFreeze(source, hard)
   if not RT.alive then return end
   local now = os.clock()
   if hard then
+    -- 长冻结等 PostHook 或 LOAD_GUARD_MAX 超时放行，两者都会重设观察期。
+    mapGuardUntil = math.huge
     if not mapFreeze.hard then
       mapFreeze.hard, mapFreeze.at, mapFreeze.source = true, now, source
       alert('map load: frozen (' .. source .. ')')
     end
   else
-    -- 预冻结是短窗口：即使这次 PreLoadMap 后面没有跟着 LoadMap，也会自己过期。
+    -- 预冻结是短窗口：即使这次 PreLoadMap 后面没有跟着 LoadMap，也会自己过期，
+    -- 观察期同样给有限上限，避免此后没有 PostHook 时把 MOD 长期挂起。
     if now >= mapFreeze.preUntil then
       alert('map load: pre-freeze (' .. source .. ')')
     end
     mapFreeze.preUntil = now + PRELOAD_HOLD
+    mapGuardUntil = math.max(mapGuardUntil, now + PRELOAD_HOLD + LOAD_SETTLE + MAP_GUARD_EXTRA)
   end
+  -- 钩子回调到下一帧之间也不能解引用属性包装值。
+  Util.setMapGuard(true)
   hudPick.settleAt = math.max(hudPick.settleAt, now + LOAD_SETTLE)
   heavyReady, heavyHeld = false, false
   clearHudPick()
@@ -582,6 +598,7 @@ local pending = { lmb = false, rmb = false, mmb = false }
 -- 这里只做 Lua 侧的引用清理，不调用任何 UObject 方法。
 RT.onWorldTeardown = function()
   heldSnapshot, heldAt, cachedPC = nil, nil, nil
+  Util.forgetClasses()
   pendingEvent = nil
   pending.lmb, pending.rmb, pending.mmb = false, false, false
   drag:forget()
@@ -590,7 +607,11 @@ RT.onWorldTeardown = function()
   breakDemo.active = false
   dragInput.frozen, dragInput.pc, dragInput.paused = false, nil, false
   pcall(function() stats:forget() end)
+  -- 自建控件同样是 UE4SS 的 UObject userdata，换世界后必须整套重建；
+  -- 这里只丢 Lua 引用，重建由观察期结束后的 rebuild() 负责。
+  pcall(function() render:forget() end)
   pcall(function() icons:forget() end)
+  pcall(function() icons:forgetWidgets() end)
   pcall(function() hudBars:forget() end)
   follow.pawn = nil
   follow.viewport, follow.viewportAt = nil, -100
@@ -668,22 +689,27 @@ local function step(dt)
   if not RT.alive then return true end
   local now = os.clock()
 
-  -- 换图冻结必须是 step 的第一件事。下面那些按键分发、menu:poll、icons:poll
-  -- 全都会碰游戏对象；旧世界一旦进入销毁流程，哪怕只读一次属性都可能崩在
-  -- UE4SS 的 ProcessEvent 上（pcall 挡不住 native 层的 ACCESS_VIOLATION）。
+  -- 换图冻结必须是 step 的第一件事。下面那些 stats:read、hudVisible、
+  -- icons:update、hudBars:update 全都会碰游戏对象；旧世界一旦进入销毁流程，
+  -- 哪怕只读一次属性都可能崩在 UE4SS 的反射路径上（pcall 挡不住 native AV）。
   -- 万一 PostHook 没来，LOAD_GUARD_MAX 秒后自动放行，不会把 MOD 永久冻住。
   if mapFreeze.hard and now - mapFreeze.at > LOAD_GUARD_MAX then
     releaseMapFreeze('guard timeout')
   end
-  if mapFreeze.hard or now < mapFreeze.preUntil or now < hudPick.settleAt then
+  local frozen = mapFreeze.hard or now < mapFreeze.preUntil or now < hudPick.settleAt
+  local guarded = frozen or now < mapGuardUntil
+  Util.setMapGuard(guarded)
+  if frozen then
+    -- 冻结期与观察期全程零 UObject 接触：收屏也不做，旧控件引用已在
+    -- onWorldTeardown 里作废，等观察期结束由 rebuild() 建一套新的。
     master = 0
-    if renderAlive() then
-      render:setMaster(0)
-      render:setBarShown('hp', false)
-      render:setBarShown('qi', false)
-    end
-    pcall(function() icons:setShown(false, 0) end)
     return false
+  end
+  -- 观察期内只读 Lua 状态，重模块与 HUD 探测都还不碰游戏对象。
+  if guarded then return false end
+  if mapGuardUntil > 0 then
+    mapGuardUntil = 0
+    alert('map load: guard released')
   end
 
   if configVisible ~= lastConfigVisible then
@@ -1038,7 +1064,8 @@ function RT.shutdown()
   drag:forget()
   breakWatch:forget()
   breakDemo.active = false
-  if mapFreeze.hard or os.clock() < mapFreeze.preUntil or os.clock() < hudPick.settleAt then
+  if mapFreeze.hard or os.clock() < mapFreeze.preUntil or os.clock() < hudPick.settleAt
+    or os.clock() < mapGuardUntil then
     -- 冻结期对象正在销毁：只丢标记，不还输入（随旧世界一起失效）。
     dragInput.frozen, dragInput.pc, dragInput.paused = false, nil, false
     hudBars:forget()
@@ -1066,7 +1093,8 @@ local function safeStep()
       drag:forget()
       pendingEvent = nil
       breakDemo.active = false
-      releaseDragInput('closed')
+      -- 换图保护期内输入锁随旧世界一起失效，不去碰旧 PlayerController。
+      if not Util.mapGuard() then releaseDragInput('closed') end
     end
     configVisible = reader:panel() ~= 'closed'
     local dt = lastClock and math.max(0, now - lastClock) or 0.016

@@ -76,10 +76,20 @@ end
 package.preload['ArcRenderer'] = function()
   return { new = function(S) capturedS = S
     return { root = widget('PBZMoHUD_Root_x'), hpBar = {}, qiBar = {},
-      build = function() return true end, cleanupOld = function() end, destroy = function() end,
+      build = function(self)
+        renderCalls.build = (renderCalls.build or 0) + 1
+        self.root = widget('PBZMoHUD_Root_x')
+        return true
+      end,
+      forget = function(self)
+        renderCalls.forget = (renderCalls.forget or 0) + 1
+        self.root = nil
+      end,
+      cleanupOld = function() end, destroy = function() end,
       applyColours = function() renderCalls.colour = (renderCalls.colour or 0) + 1 end,
       applyTransforms = function() renderCalls.transform = (renderCalls.transform or 0) + 1 end,
-      setUiScale = function() end, setAnchor = function() end, setMaster = function() end,
+      setUiScale = function() end, setAnchor = function() end,
+      setMaster = function() renderCalls.master = (renderCalls.master or 0) + 1 end,
       setBarShown = function() end,
       resetGhosts = function() renderCalls.resetGhosts = (renderCalls.resetGhosts or 0) + 1 end,
       settleFades = function() renderCalls.settleFades = (renderCalls.settleFades or 0) + 1 end,
@@ -97,13 +107,14 @@ package.preload['Icons'] = function()
     iconsStub = { S = S, shownValue = true, dragTipVisible = false, medX = 0, medY = 0, ultX = 0, ultY = 0,
       medEntries = {}, ultEntries = {},
       update = function(_, _, ctx) iconsCtx = ctx end,
-      setShown = function(self, s) self.shownValue = s end,
+      setShown = function(self, s) self.shownValue = s; self.shownCalls = (self.shownCalls or 0) + 1 end,
       showDragTip = function(self, text, vis) self.dragTipVisible = vis == true; self.tipText = text end,
       computeLayout = function() end, applyPositions = function() end,
       hitAt = function() return nil end, groupOrigin = function() return 0, 0, 0 end,
       setGroupAt = function() end, entryOff = function() return 0, 0 end,
       groupEntries = function() return {} end,
-      forget = function() end, destroy = function() end }
+      forget = function() end, forgetWidgets = function() end,
+      destroy = function() end }
     return iconsStub
   end }
 end
@@ -335,17 +346,30 @@ eq(renderCalls.resetGhosts or 0, resets + 2, 'ghost reset on hud return')
 frames(5)
 eq(renderCalls.resetGhosts or 0, resets + 2, 'ghost reset only on the resume frame')
 
--- 换图冻结：重模块停摆，PostHook + 沉降 + HUD 出现后恢复。
+-- 换图冻结：重模块停摆，PostHook + 沉降 + 观察期 + HUD 出现后恢复。
 -- 信号门判据是「HUD 此刻在不在屏幕上」，所以沉降期内把 HUD 设成不可见，
 -- 沉降过期后仍被挡住；直到 HUD 出现才当帧放行。
 hud.RenderOpacity = 0
 local before = barsCalls
+local beforeMaster = renderCalls.master or 0
+local beforeShown = iconsStub.shownCalls or 0
+local beforeBuild = renderCalls.build or 0
+local beforeForget = renderCalls.forget or 0
 loadPre()
 frames(10)
 eq(barsCalls, before, 'heavy modules frozen during load')
+eq(renderCalls.master or 0, beforeMaster, 'frozen frames never touch UMG widgets')
+eq(iconsStub.shownCalls or 0, beforeShown, 'frozen frames never touch icon widgets')
 loadPost()
-frames(80, 0.02)   -- 1.6s：沉降 1.0s 过后 HUD 仍未显示，信号门继续挡住
-eq(barsCalls, before, 'still frozen during settle and hidden hud')
+frames(115, 0.02)  -- 2.3s：仍在沉降 1.0s + 观察期 1.5s 之内
+eq(barsCalls, before, 'heavy modules held during settle and map guard')
+eq(renderCalls.master or 0, beforeMaster, 'no widget writes during the whole guard')
+eq(iconsStub.shownCalls or 0, beforeShown, 'no icon widget writes during the whole guard')
+eq(renderCalls.build or 0, beforeBuild, 'no rebuild while guard is active')
+ok((renderCalls.forget or 0) > beforeForget, 'widget refs dropped on world teardown')
+frames(60, 0.02)   -- 观察期结束：重建一套控件，重模块仍等 HUD 信号
+ok((renderCalls.build or 0) > beforeBuild, 'widgets rebuilt after guard lifts')
+eq(barsCalls, before, 'heavy modules still gated by the HUD signal')
 hud.RenderOpacity = 1
 frames(5, 0.02)    -- HUD 出现，当帧放行
 ok(barsCalls > before, 'heavy modules resume after settle + hud')
