@@ -636,7 +636,7 @@ function HudBars:dropArcNumbers()
   local group = self.arcs and self.arcs.group
   local current = group and identity(group)
   for _, number in pairs(list) do
-    if current == number.groupId then
+    if current == number.groupId and valid(number.widget) then
       pcall(function() number.widget:RemoveFromParent() end)
     end
   end
@@ -858,7 +858,10 @@ end
 function HudBars:dropNumbers(entry)
   if #(entry.numbers or {}) == 0 then return end
   for _, number in ipairs(entry.numbers) do
-    pcall(function() number.widget:RemoveFromParent() end)
+    -- 控件可能已随条一起被游戏重建回收；pcall 挡不住野指针。
+    if valid(number.widget) then
+      pcall(function() number.widget:RemoveFromParent() end)
+    end
   end
   entry.numbers, entry.numbersTriedAt = {}, nil
 end
@@ -1438,16 +1441,10 @@ function HudBars:pinShowUp(entry, now)
         local own = item.pinnedTo and math.abs(have - item.pinnedTo) <= SHOW_UP_TOLERANCE
         if not own then item.grown = have end
         pcall(function() item.node.CachedShowUp = want end)
+        -- 蓝图只在自己的 setter 里把比例同步给填充材质：只改属性的话，上限
+        -- 变化后的那次增长动画会让填充停在长的那一档。每次纠正都走 setter。
+        pcall(function() item.node:SetShowUpRatio(want) end)
         local after = numProp(item.node, 'CachedShowUp')
-        if after == nil or math.abs(after - want) > SHOW_UP_TOLERANCE then
-          pcall(function() item.node:SetShowUpRatio(want) end)
-          after = numProp(item.node, 'CachedShowUp')
-        elseif not item.showUpKicked then
-          -- 蓝图可能只从它自己的 setter 重绘；在这里推它一次。
-          item.showUpKicked = true
-          pcall(function() item.node:SetShowUpRatio(want) end)
-          after = numProp(item.node, 'CachedShowUp') or after
-        end
         item.pinnedTo = want
         if (entry.showUpLogAt or 0) + WATCH_INTERVAL <= now then
           entry.showUpLogAt = now
@@ -1499,6 +1496,65 @@ function HudBars:pinLength(entry, now)
   end
 end
 
+-- 填充材质 MID_Bar 上的 ShowUpRatio，就是画面上填充实际画到的比例。
+-- 下标按材质实例缓存，名字只在换实例时重新读。
+local function drawnShowUp(item)
+  local resource = prop(item.node, 'MID_Bar')
+  if not valid(resource) then return nil end
+  local list, count = scalarList(resource)
+  if list == nil then return nil end
+  local id = identity(resource)
+  if item.drawnRes ~= id or item.drawnIndex == nil or item.drawnIndex > count then
+    item.drawnRes, item.drawnIndex = id, nil
+    for index = 1, count do
+      local scalarItem = scalarAt(list, index)
+      if tostring(parameterNameOf(scalarItem) or ''):lower() == 'showupratio' then
+        item.drawnIndex = index
+        break
+      end
+    end
+    if item.drawnIndex == nil then return nil end
+  end
+  local scalarItem, value = scalarAt(list, item.drawnIndex)
+  if value == nil then return nil end
+  return value, resource, list, item.drawnIndex, scalarItem
+end
+
+-- 属性已经钉住、画面却还停在别的长度：等它停稳（游戏的动画播完）再纠正，
+-- 先走蓝图 setter，仍不行才直接写材质。只有先观察到「属性钉住时材质也
+-- 等于目标」才认为这个标量就是填充长度，否则一律不碰。
+function HudBars:pinDrawn(item, want)
+  local drawn, resource, list, index, scalarItem = drawnShowUp(item)
+  if drawn == nil then return end
+  local settled = near(numProp(item.node, 'CachedShowUp'), want, SHOW_UP_TOLERANCE)
+  if not item.drawnLogged then
+    item.drawnLogged = true
+    self.log(string.format('hud bars: %s fill material ShowUpRatio %.3f, CachedShowUp %.3f, target %.3f',
+      objectName(item.node), drawn, numProp(item.node, 'CachedShowUp') or -1, want))
+  end
+  if math.abs(drawn - want) <= SHOW_UP_TOLERANCE then
+    if settled then item.drawnTracks = true end
+    item.drawnLast, item.drawnKicked = nil, nil
+    return
+  end
+  if not (item.drawnTracks and settled) then
+    item.drawnLast = nil
+    return
+  end
+  local stable = item.drawnLast ~= nil and math.abs(drawn - item.drawnLast) <= SHOW_UP_TOLERANCE
+  item.drawnLast = drawn
+  if not stable then return end
+  if not item.drawnKicked then
+    item.drawnKicked = true
+    pcall(function() item.node:SetShowUpRatio(want) end)
+    self.log(string.format('hud bars: %s fill drawn at %.3f, setter -> %.3f',
+      objectName(item.node), drawn, want))
+  elseif setScalar(resource, list, index, scalarItem, want, 'ShowUpRatio') then
+    self.log(string.format('hud bars: %s fill drawn at %.3f, material -> %.3f',
+      objectName(item.node), drawn, want))
+  end
+end
+
 -- 每半秒回读一次；持续失败只告警一次。
 function HudBars:watchPins(entry, now)
   if now < (entry.watchAt or 0) then return end
@@ -1508,6 +1564,7 @@ function HudBars:watchPins(entry, now)
     local x, show = self:targetBarX(item.class, entry), self:targetShowUp(item.class, entry)
     if x and not near(numProp(item.node, 'BarX'), x, BAR_X_TOLERANCE) then failed = true end
     if show and not near(numProp(item.node, 'CachedShowUp'), show, SHOW_UP_TOLERANCE) then failed = true end
+    if show and valid(item.node) then self:pinDrawn(item, show) end
   end
   entry.watchFailures = failed and ((entry.watchFailures or 0) + 1) or 0
   if entry.watchFailures < 3 then return end
@@ -1675,7 +1732,9 @@ function HudBars:restoreBars(entry)
       -- 忘掉在这里记录的增长：条又属于游戏了，下一次钉住必须去测量
       -- 那时游戏已经达到的长度。
       item.grownX, item.pinnedXTo = nil, nil
-      item.grown, item.pinnedTo, item.showUpKicked = nil, nil, nil
+      item.grown, item.pinnedTo = nil, nil
+      item.drawnTracks, item.drawnLast, item.drawnKicked, item.drawnLogged = nil, nil, nil, nil
+      item.drawnRes, item.drawnIndex = nil, nil
       item.want, item.logged = nil, nil
       item.cap, item.capWas, item.capHidden, item.capTriedAt = nil, nil, nil, nil
     end

@@ -148,6 +148,10 @@ end
 
 local function trackProgress(node)
   local values = { BarX = node.BarX, CachedShowUp = node.CachedShowUp }
+  -- 填充材质只跟着蓝图 setter 走，直接写属性不会改到它。
+  local fill = material(node._name .. '.MID_Bar', { node.CachedShowUp })
+  fill.ScalarParameterValues[1].ParameterInfo.Name = 'ShowUpRatio'
+  node.MID_Bar = fill
   node.BarX, node.CachedShowUp = nil, nil
   node._values = values
   setmetatable(node, {
@@ -160,7 +164,10 @@ local function trackProgress(node)
     end,
   })
   function node:SetPropertyValue(key, value) self[key] = value end
-  function node:SetShowUpRatio(value) self.CachedShowUp = value end
+  function node:SetShowUpRatio(value)
+    self.CachedShowUp = value
+    if not self._showReadOnly and not self._fillStuck then fill.ScalarParameterValues[1].ParameterValue = value end
+  end
 end
 
 local function buildBar(suffix)
@@ -647,6 +654,45 @@ assert(oldEntry.progress == nil and oldEntry.index == nil and oldEntry.backdrops
 assert(oldEntry.rootName == nil and oldEntry.pinned == nil and oldEntry.numbers == nil)
 assert(inst.hp._writes == oldWrites and root._kids[#root._kids]._removed == numRemoved)
 assert(oldProgress[1].node ~= nil)
-result.phases = 15
+
+-- 阶段 16：同一代际里上限变化。游戏走自己的 setter 把填充拉长，或者它的
+-- 增长动画只把填充材质推长；两种情况画面都要回到钉住的长度。
+local function drawn(node) return node.MID_Bar.ScalarParameterValues[1].ParameterValue end
+S.NativeBars, S.HudNumbers = 'pin', false
+frames(60)
+pinned(inst)
+near(drawn(inst.hp), 0.2, '首次钉住的画面')
+local sameGeneration = bars.entries[1].generation
+for i = 1, 3 do
+  inst.hp:SetShowUpRatio(0.5 + i * 0.05)
+  inst.hp._values.BarX = 900 + i * 10
+  snapshot.hpMax = 300 + i
+  frames(60)
+  pinned(inst)
+  near(drawn(inst.hp), 0.2, '同代际再次增长后画面没回来')
+end
+assert(bars.entries[1].generation == sameGeneration, '应在同一代际里纠正')
+frames(4, 1)
+inst.hp.MID_Bar.ScalarParameterValues[1].ParameterValue = 0.55
+frames(8, 1)
+pinned(inst)
+near(drawn(inst.hp), 0.2, '只有材质被动画推长时没纠正')
+-- setter 救不回来时直接写材质。
+inst.hp._fillStuck = true
+inst.hp.MID_Bar.ScalarParameterValues[1].ParameterValue = 0.6
+frames(12, 1)
+near(drawn(inst.hp), 0.2, 'setter 无效时没写材质')
+-- 从没见过材质与钉住值一致：不认它是填充长度，一律不碰。
+snapshot.hpMax = 200
+bars:release()
+inst, root = buildBar('0')
+inst.hp._fillStuck = true
+inst.hp.MID_Bar.ScalarParameterValues[1].ParameterValue = 0.9
+local fillWrites = inst.hp.MID_Bar._writes
+frames(60)
+frames(12, 1)
+pinned(inst)
+assert(inst.hp.MID_Bar._writes == fillWrites and drawn(inst.hp) == 0.9, '未校准的材质被写入')
+result.phases = 16
 RESULT = result
-print('native_bars: 15 phases passed')
+print('native_bars: 16 phases passed')
