@@ -38,10 +38,6 @@ Without PBZMoConfig, edit `Scripts/settings.ini` directly (`Key = value`, boolea
 - Read-only towards the game: no character stats, combat state or save data are modified. The native bar pin only writes to the game's own bar widgets.
 - The settings text follows the language selected in PBZMoConfig; missing translations fall back to English.
 
-## Known issues
-
-Break detection reads gameplay tags and animation names. A game update that renames them can stop the break hint until the mod is updated. Offline tests cannot replace in-game checks of rotation, dragging and native bar length after level changes or equipment upgrades.
-
 ## How to build
 
 Nothing to build: the release contains the files of this repository.
