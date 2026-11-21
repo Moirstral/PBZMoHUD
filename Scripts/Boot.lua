@@ -5,7 +5,7 @@ Boot.DIR = source:match('^(.*)/[^/]+$') or '.'
 Boot.ROOT = Boot.DIR:match('^(.*)/[^/]+$') or '.'
 Boot.VERSION = '1.0.2'
 Boot.CONFIG = Boot.DIR .. '/settings.ini'
-Boot.LOG = Boot.DIR .. '/PBZMoHUD.log'
+Boot.LOG = Boot.ROOT .. '/PBZMoHUD.log'
 
 function Boot.env(log)
   local function read(path)

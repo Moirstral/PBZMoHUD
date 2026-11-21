@@ -418,7 +418,7 @@ check(opened == 1 and closed == 1, 'one settings read, handle closed')
 local envLog = function() end
 local env = Boot.env(envLog)
 check(Boot.DIR == SCRIPTS and Boot.ROOT == SCRIPTS:gsub('/Scripts$', ''), 'boot paths')
-check(Boot.CONFIG == SCRIPTS .. '/settings.ini' and Boot.LOG == SCRIPTS .. '/PBZMoHUD.log', 'boot files')
+check(Boot.CONFIG == SCRIPTS .. '/settings.ini' and Boot.LOG == Boot.ROOT .. '/PBZMoHUD.log', 'boot files')
 check(env.log == envLog and env.now == os.clock and env.write == nil, 'read-only boot environment')
 check(env.read(Boot.CONFIG) == iniText, 'boot reads exact file')
 check(env.read(SCRIPTS .. '/nonexistent-file.ini') == nil, 'boot missing file')
