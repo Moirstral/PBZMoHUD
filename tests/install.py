@@ -91,6 +91,8 @@ def main():
             ok((target / 'Scripts/settings.ini').is_file(), 'settings.ini installed')
             ok((target / 'enabled.txt').is_file(), 'enabled.txt installed')
             ok((target / 'lang/zh-Hans.ini').is_file(), 'language installed')
+            ok((target / 'assets/weapon-cooldown.png').read_bytes()
+               == (MOD / 'assets/weapon-cooldown.png').read_bytes(), 'cooldown atlas installed')
             ok((target / 'README.md').is_file(), 'README installed')
             ok(read(target / 'Scripts/main.lua') == read(MOD / 'Scripts/main.lua'),
                'installed code matches source')

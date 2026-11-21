@@ -2,6 +2,49 @@
 -- 游戏把这些计数放在 HUD 控件里而不是属性集里，所以药品图标
 -- 取自 WB_quickslot_C，数字取自 W_WeaponUI_C。
 local Colors = require('Colors')
+local ArcStyle = require('ArcStyle')
+local COOLDOWN_ART = require('Boot').ROOT .. '/assets/weapon-cooldown.png'
+local COOLDOWN_SIZE = 32
+-- 图集：60 张序列帧 + 第 61 格整圈底轨。底轨和弧线共用这一张贴图、一次导入，
+-- 所以下面是按格子算 UV，不要再手写图集宽高。
+local COOLDOWN_STEPS = 60
+local COOLDOWN_TRACK = COOLDOWN_STEPS + 1
+local COOLDOWN_CELL, COOLDOWN_PAD, COOLDOWN_COLUMNS = 80, 2, 10
+local COOLDOWN_STRIDE = COOLDOWN_CELL + COOLDOWN_PAD * 2
+local COOLDOWN_ATLAS_W = COOLDOWN_COLUMNS * COOLDOWN_STRIDE
+local COOLDOWN_ATLAS_H = math.ceil(COOLDOWN_TRACK / COOLDOWN_COLUMNS) * COOLDOWN_STRIDE
+-- CD 条只画一段会变长的白弧，落在天空、雪地这类亮场景里几乎看不见。
+-- 弧线下面铺一圈黑色半透明底轨，玩家才能看出还差多少。底轨不是序列帧的最后一帧
+-- —— 那一帧的尾部有源图自带的渐隐，铺开会在 12 点方向留一道缺口 —— 而是同一
+-- 内外半径、角度方向上均匀的闭合环，见 tools/build_cooldown.py。
+local COOLDOWN_BACK = { R = 0, G = 0, B = 0, A = 1 }
+-- 半透明交给控件级的 SetRenderOpacity：SetColorAndOpacity 的 alpha 要经过笔刷
+-- 的染色路径，隔着渲染目标不一定按预期相乘，而整体透明度是确定生效的。
+local COOLDOWN_BACK_OPACITY = 0.45
+local COOLDOWN_Z, COOLDOWN_BACK_Z = 4, 3
+local COOLDOWN_GEOMETRY = { 'QiRadius', 'QiThickness', 'QiArcSide', 'QiRotation', 'QiOffsetX', 'QiOffsetY' }
+
+-- cell 是从 1 数起的格子序号：1..60 是序列帧，61 是底轨。
+local function cooldownRegion(cell)
+  local index = cell - 1
+  local x = index % COOLDOWN_COLUMNS * COOLDOWN_STRIDE + COOLDOWN_PAD
+  local y = math.floor(index / COOLDOWN_COLUMNS) * COOLDOWN_STRIDE + COOLDOWN_PAD
+  return {
+    min = { X = x / COOLDOWN_ATLAS_W, Y = y / COOLDOWN_ATLAS_H },
+    max = { X = (x + COOLDOWN_CELL) / COOLDOWN_ATLAS_W,
+      Y = (y + COOLDOWN_CELL) / COOLDOWN_ATLAS_H }, bIsValid = true,
+  }
+end
+
+local COOLDOWN_REGIONS = {}
+for frame = 1, COOLDOWN_STEPS do COOLDOWN_REGIONS[frame] = cooldownRegion(frame) end
+local COOLDOWN_TRACK_REGION = cooldownRegion(COOLDOWN_TRACK)
+
+-- 已完成比例折算成图集格子（1 基）。最后一格是一整圈，与「没有冷却」是同一个
+-- 画面，所以调用处一律拿它和 COOLDOWN_STEPS 比，不要各自写取整。
+local function cooldownFrame(ratio)
+  return math.max(1, math.floor(ratio * COOLDOWN_STEPS + 0.5))
+end
 
 local Icons = {}
 Icons.__index = Icons
@@ -18,9 +61,11 @@ local DIM_COLOUR = { R = 0, G = 0, B = 0, A = 0.5 }
 
 -- 这些是 IconScale = 1 时渲染出的像素值；滑块会让它们一起放大。
 local ICON_H = 42
+local WEAPON_SIZE = 43
+local ROTATION_UNIT = math.sqrt(0.5)
 local NUM_GAP = 8
 local ENTRY_GAP = 25
-local BOTTOM_MARGIN = 152
+local BOTTOM_MARGIN = 167
 local NUM_FONT = 18
 local NUM_LINE = 1.2
 -- 静态贴图里的画面位于其包围盒中线偏上，而实时瓶身画面偏下，因此静态图标
@@ -35,6 +80,13 @@ local NUM_CHAR_W = 13
 local NUM_MIN_W = 20
 local READ_INTERVAL = 0.10
 local SCAN_INTERVAL = 0.50
+-- CDRatio 由游戏侧的动画驱动，不是常驻状态：HUD 重建或重新显示之后，它可能
+-- 停在某个非零值上不再变化。所以「有进度」不等于「在冷却」，只有值在一段
+-- 时间内的确变过才画环（见 layoutCooldown）。
+local COOLDOWN_STALL = 1.5
+-- 一次读数的有效变化量。冷却最长按分钟计，60 秒的冷却每 0.1 秒只走 0.0017，
+-- 因此这里必须比「一帧图集」小得多（1/60 ≈ 0.0167），否则慢冷却会被当成静止。
+local COOLDOWN_MOVE_EPS = 1e-4
 
 -- IconScale 会乘上这些基础像素值，因此图标、它们的数字以及彼此之间的间隙
 -- 都会一起放大。NUM_FONT 是数字最终绘制出来的高度；文本控件本身则通过它的
@@ -46,9 +98,30 @@ local ICON_GREY = { R = 0.42, G = 0.42, B = 0.42, A = 0.85 }
 local ICON_WHITE = { R = 1, G = 1, B = 1, A = 1 }
 local ULT_TINT = { R = 0.62, G = 0.30, B = 1, A = 1 }
 local ULT_DIM = 0.34
+-- 官方那层充能不是武器贴图的副本，而是 W_WeaponUI 里独立的一层 UImage
+-- （PureShachiImage），brush 上是游戏自己的材质：菱形、柔边、透明区上的颜色
+-- 全部由材质按 Ratio 生成，与武器贴图无关。MoHUD 直接搬它 brush 上的资源对象，
+-- 游戏用的是动态实例时两边共用同一个；比例由 MOD 自己按变化写，不能指望游戏。
+-- FILL_ART 只是退路：官方控件拿不到时按路径自己找材质。
+local FILL_ART = '/Game/PBZContent/VFX/SceneFX/UI/BattleSystem/Assets/M_UI_PureShaChi_001.M_UI_PureShaChi_001'
+-- 下面这些只服务退路（自建实例），共用官方实例时只写 FILL_RATIO。
+local FILL_TINT = ULT_TINT
+local FILL_RATIO, FILL_COLOR = 'Ratio', 'Color'
+-- 比例在充能过程中每次变化都要写，FName 建一次就留着；模块加载阶段不碰 UE 绑定。
+local fillRatioParam
+local function ratioParam()
+  fillRatioParam = fillRatioParam or FName(FILL_RATIO)
+  return fillRatioParam
+end
+-- 热路径：pcall 直接传参，不为每次写入新建闭包。
+local function setScalarParam(mid, key, value)
+  return mid:SetScalarParameterValue(key, value)
+end
+-- 退路也失败时的重试间隔（秒）。否则每次读数都会去查一遍对象表。
+local FILL_RETRY = 2
 
--- 精纯杀气的充能直接画进图标本身：图标保持原有的单一着色，
--- 再把它的一份全亮副本按其自身高度的充能比例裁剪，
+-- 绝招图标的充能画进图标本身：图标保持原有的单一着色，
+-- 再把它的一份染色副本按其自身高度的充能比例裁剪，
 -- 于是图标从底部向上填充。
 -- CLIP 即 FWidgetClipping::ClipToBounds。
 local CLIP_TO_BOUNDS = 1
@@ -94,11 +167,13 @@ end
 
 -- 槽位可能被它自己的标志隐藏，也可能被游戏为未装备槽位而折叠的
 -- 某一层覆盖物隐藏，所以整条短链都必须一致。
-local function chainVisible(widget)
+local function chainVisible(widget, hidden)
   local cur = widget
   if not valid(cur) then return false end
   for _ = 1, 6 do
     local okV, visibility = pcall(function() return cur.Visibility end)
+    local record = hidden and hidden[fullName(cur)]
+    if record and visibility == VIS.Hidden then visibility = record.was end
     if okV and (visibility == VIS.Collapsed or visibility == VIS.Hidden) then return false end
     local okO, opacity = pcall(function() return cur.RenderOpacity end)
     if okO and type(opacity) == 'number' and opacity <= 0.01 then return false end
@@ -113,11 +188,11 @@ end
 -- 游戏是否仍在绘制某读数所属的图标：HUD 有它自己的图像控件时就用那个，
 -- 否则用承载数字的那一行。两者任一存在即可；数字随图标折叠而图标仍在
 -- 绘制，就是零的样子。
-local function iconPresent(num, icon)
-  if chainVisible(icon) then return true end
+local function iconPresent(num, icon, hidden)
+  if chainVisible(icon, hidden) then return true end
   if not valid(num) then return false end
   local ok, parent = pcall(function() return num:GetParent() end)
-  return ok and valid(parent) and chainVisible(parent)
+  return ok and valid(parent) and chainVisible(parent, hidden)
 end
 
 local function inViewport(widget)
@@ -187,6 +262,16 @@ local function addChild(parent, widget, x, y, w, h, z)
   slot:SetSize({ X = w or 0, Y = h or 0 })
   if z then slot:SetZOrder(z) end
   return slot
+end
+
+-- 丢弃充能层前先把它的控件从画布上摘掉，否则换武器/重建时会一层层叠加。
+local function dropFill(icon)
+  if icon and icon.fill then
+    if valid(icon.fill.image) then
+      pcall(function() icon.fill.image:RemoveFromParent() end)
+    end
+    icon.fill = nil
+  end
 end
 
 local cachedPC = nil
@@ -539,10 +624,9 @@ end
 -- 填充是图标的一份副本，被裁剪到其自身高度的充能部分。面板被
 -- 调整到该部分的大小，并把子控件裁剪到自己的边界，因此副本是在
 -- 充能线处被切断而不是被拉伸，火焰便在图标本身之上
--- 从底部向上填充。
+-- 从底部向上填充。只服务绝招火焰图标，主武器走 buildChargeFill。
 function Icons:buildFill(entry, name, z)
-  if not entry.staticPath then return nil end
-  local resource = unwrap(StaticFindObject(entry.staticPath))
+  local resource = entry.staticPath and unwrap(StaticFindObject(entry.staticPath))
   if not valid(resource) then return nil end
   local panel = StaticConstructObject(cls(CLASS.canvas), self.tree, FName('PBZMoHUD_Icons_' .. name .. '_fill'))
   local icon = StaticConstructObject(cls(CLASS.image), self.tree, FName('PBZMoHUD_Icons_' .. name .. '_fillIcon'))
@@ -550,7 +634,7 @@ function Icons:buildFill(entry, name, z)
   if not applyBrush(icon, { resource = resource, class = 'Texture2D', key = entry.staticPath }) then
     return nil
   end
-  pcall(function() icon:SetColorAndOpacity(entry.tint) end)
+  pcall(function() icon:SetColorAndOpacity(entry.tint or ICON_WHITE) end)
   local panelSlot = addChild(self.canvas, panel, 0, 0, 0, 0, z)
   local iconSlot = valid(panelSlot) and addChild(panel, icon, 0, 0, 0, 0, 0) or nil
   if not valid(iconSlot) then
@@ -570,10 +654,300 @@ function Icons:buildFill(entry, name, z)
   -- 记录一次；若读到空值，填充会显示成一整个亮色图标。
   self.log(string.format('icons fill clip wrote=%s read=%s', tostring(wrote), tostring(readBack)))
   return {
-    panel = panel, panelSlot = panelSlot,
-    icon = icon, iconSlot = iconSlot,
+    panel = panel, panelSlot = panelSlot, icon = icon, iconSlot = iconSlot,
     shown = nil, x = nil, y = nil, w = nil, h = nil, innerY = nil,
   }
+end
+
+-- 主武器的充能层就是官方 W_WeaponUI 里的 PureShachiImage：它挂的材质自己画
+-- 那层菱形，形状、柔边、透明区上的颜色都由材质决定，与武器贴图无关。所以这里
+-- 直接把它 brush 的资源对象搬过来，比例由 placeWeaponFill 自己写（游戏只往
+-- 它自己那份实例上写，换控件后就不更新了）。拿不到官方控件才退回裸材质，此时
+-- 不额外旋转：菱形朝向在材质里，跟着图标再转 45° 会拧成另一个方向。
+function Icons:buildChargeFill(name)
+  local official = valid(self.weapon) and unwrap(prop(self.weapon, 'PureShachiImage')) or nil
+  local info, angle = nil, 0
+  if valid(official) then
+    info = brushInfo(official)
+    pcall(function() angle = tonumber(official.RenderTransform.Angle) or 0 end)
+  end
+  -- brush 上必须是材质。游戏换过资源的话（拿到的不是材质）就退回成品材质，
+  -- 并把角度清零：没有官方控件可抄，朝向由材质自己决定。
+  local material = info and info.resource
+  local class = (info and info.class) or ''
+  if not (valid(material) and class:find('Material', 1, true)) then
+    material = unwrap(StaticFindObject(FILL_ART))
+    if not valid(material) then return nil end
+    class, angle = className(material) or '', 0
+  end
+  local image = StaticConstructObject(cls(CLASS.image), self.tree, FName('PBZMoHUD_Icons_' .. name .. '_charge'))
+  if not valid(image) then return nil end
+  -- 游戏自己的动态实例就共用：颜色、贴图这些参数它已经设好，我们只写比例。
+  local shared = class:find('MaterialInstanceDynamic', 1, true) ~= nil
+  local mid
+  if shared then
+    if not pcall(function() image:SetBrushResourceObject(material) end) then return nil end
+    mid = material
+  else
+    if not pcall(function() image:SetBrushFromMaterial(material) end) then return nil end
+    if not pcall(function() mid = image:GetDynamicMaterial() end) or not valid(mid) then return nil end
+    pcall(function() mid:SetVectorParameterValue(FName(FILL_COLOR), FILL_TINT) end)
+  end
+  pcall(function() image:SetColorAndOpacity(ICON_WHITE) end)
+  pcall(function() image:SetRenderTransformPivot({ X = 0.5, Y = 0.5 }) end)
+  if angle ~= 0 then pcall(function() image:SetRenderTransformAngle(angle) end) end
+  local slot = addChild(self.canvas, image, 0, 0, 0, 0, 3)
+  if not valid(slot) then
+    pcall(function() image:RemoveFromParent() end)
+    return nil
+  end
+  pcall(function() image:SetVisibility(VIS.Collapsed) end)
+  self.log(string.format('icons charge layer %s shared=%s angle=%s', fullName(material), tostring(shared), tostring(angle)))
+  return { image = image, slot = slot, mid = mid, source = material, shared = shared, shown = false }
+end
+
+function Icons:readWeapon(entry, normal)
+  entry.weaponReady = false
+  if self.S[normal and 'MainWeaponIcon' or 'PhantomEdgesIcon'] == false then return end
+  if not entry.hasValue or not valid(self.backpack) then return end
+  local index = Util.call(self.backpack, normal and 'GetCurrentMainWeaponIndex' or 'GetCurrentShaqiWeaponIndex')
+  if type(index) ~= 'number' or index < 0 then return end
+  local soft = Util.call(self.backpack, 'GetWeaponIcon', index, normal)
+  if soft == nil then return end
+  -- 只解析已加载的纹理，不在切换武器时同步加载资源。
+  local resource = Util.call(cls('/Script/Engine.Default__KismetSystemLibrary'), 'Conv_SoftObjectReferenceToObject', soft)
+  if not valid(resource) then return end
+  local icon = entry.weaponIcon
+  if not icon then
+    local image = StaticConstructObject(cls(CLASS.image), self.tree, FName('PBZMoHUD_Icons_' .. entry.offId .. '_weapon'))
+    if not valid(image) then return end
+    image:SetVisibility(VIS.Collapsed)
+    image:SetColorAndOpacity(ICON_WHITE)
+    image:SetRenderTransformPivot({ X = 0.5, Y = 0.5 })
+    image:SetRenderTransformAngle(-45)
+    local slot = addChild(self.canvas, image, 0, 0, WEAPON_SIZE, WEAPON_SIZE, 2)
+    if not valid(slot) then image:RemoveFromParent(); return end
+    icon = { image = image, slot = slot }
+    entry.weaponIcon = icon
+  end
+  if icon.resource ~= resource then
+    if not applyBrush(icon.image, { resource = resource, class = 'Texture2D' }) then return end
+    icon.resource = resource
+    local w = tonumber(Util.call(resource, 'Blueprint_GetSizeX')) or 0
+    local h = tonumber(Util.call(resource, 'Blueprint_GetSizeY')) or 0
+    icon.ratio = w > 0 and h > 0 and w / h or 1
+    -- 官方那层也可能随武器换掉材质实例：手里这份还 valid，但已经不再被游戏写入，
+    -- 画的仍是上一把武器的画面。只在换武器这一刻比对一次。
+    if normal and icon.fill and self.S.UltChargeBar ~= false then
+      local official = valid(self.weapon) and unwrap(prop(self.weapon, 'PureShachiImage')) or nil
+      local info = valid(official) and brushInfo(official) or nil
+      local source = info and info.resource
+      if valid(source) and source ~= icon.fill.source then dropFill(icon) end
+    end
+  end
+  if normal and self.S.UltChargeBar ~= false then
+    -- 官方实例可能被销毁或重建，手里这份就成了空壳（比例永远停在旧值，
+    -- 紫色不显示）。发现它失效就丢掉，下面重建。
+    if icon.fill and not valid(icon.fill.mid) then dropFill(icon) end
+    if not icon.fill then
+      -- 材质可能还没加载。失败后歇一会儿再试，别每次读数都查一遍对象表。
+      local now = os.clock()
+      if now >= (icon.fillRetryAt or 0) then
+        icon.fill = self:buildChargeFill(entry.offId .. '_weapon')
+        if not icon.fill then icon.fillRetryAt = now + FILL_RETRY end
+      end
+    end
+  end
+  entry.weaponReady = true
+end
+
+function Icons:weaponRect(entry, x, y)
+  local w, h = entry.weaponW, entry.weaponH
+  return x + (entry.iconW - w) / 2, self:artTop(entry, y) + (entry.iconH - h) / 2, w, h
+end
+
+-- 充能层的槽位就是布局为旋转后的图标留出的那一格，材质自己按比例露出下面
+-- 那部分，所以这里只跟位置和尺寸，不再裁剪，也不再喂贴图参数。两者同心。
+-- 充能层盖在武器图标上面：它本身就是半透明浅紫，官方也是这么画的，不压暗底图。
+function Icons:placeWeaponFill(icon, shown, bounds)
+  local fill = icon.fill
+  if not fill then return end
+  local ratio = tonumber(self.ultRatio)
+  local charging = shown and self.S.UltChargeBar ~= false
+    and type(ratio) == 'number' and ratio == ratio and ratio < 1
+  local visible = charging and ratio > 0
+  if fill.shown ~= visible then
+    pcall(function() fill.image:SetVisibility(visible and VIS.HitTestInvisible or VIS.Collapsed) end)
+    fill.shown = visible
+  end
+  if not visible then return end
+  -- 图标转过 45°，它占的方框（对角线 = (w + h) / √2）就是 entry.iconW/iconH。
+  local side = bounds or (icon.w + icon.h) * ROTATION_UNIT
+  local x, y = icon.x + (icon.w - side) / 2, icon.y + (icon.h - side) / 2
+  if fill.x ~= x or fill.y ~= y then
+    pcall(function() fill.slot:SetPosition({ X = x, Y = y }) end)
+    fill.x, fill.y = x, y
+  end
+  if fill.w ~= side or fill.h ~= side then
+    pcall(function() fill.slot:SetSize({ X = side, Y = side }) end)
+    fill.w, fill.h = side, side
+  end
+  -- 共用官方实例时也要自己写比例：游戏只往它「自己的」实例上写，
+  -- 换武器/重建控件后句柄就停在最后一次的值（常常是 0），层就整块不显示。
+  -- 写失败不记账，下一帧再试；成功才记住，避免每帧重复写同一个值。
+  if fill.ratio ~= ratio then
+    if pcall(setScalarParam, fill.mid, ratioParam(), ratio) then fill.ratio = ratio end
+  end
+end
+
+function Icons:placeWeapon(entry, x, y)
+  local icon = entry.weaponIcon
+  if not icon then return end
+  local shown = entry.shown and entry.useWeapon == true
+  if icon.shown ~= shown then
+    icon.image:SetVisibility(shown and VIS.HitTestInvisible or VIS.Collapsed)
+    icon.shown = shown
+  end
+  if not shown then self:placeWeaponFill(icon, false, entry.iconW); return end
+  local wx, wy, w, h = self:weaponRect(entry, x, y)
+  if icon.x ~= wx or icon.y ~= wy then
+    icon.slot:SetPosition({ X = wx, Y = wy })
+    icon.x, icon.y = wx, wy
+  end
+  if icon.w ~= w or icon.h ~= h then
+    icon.slot:SetSize({ X = w, Y = h })
+    icon.w, icon.h = w, h
+  end
+  self:placeWeaponFill(icon, true, entry.iconW)
+end
+
+-- CD 条的每一层都是同一个控件：同贴图、同尺寸、轴心在左上，只差 UV 和着色。
+function Icons:cooldownLayer(resource, name, z, region, colour, opacity)
+  local image = StaticConstructObject(cls(CLASS.image), self.tree, FName(name))
+  if not valid(image) then return nil end
+  local slot = addChild(self.canvas, image, 0, 0, COOLDOWN_SIZE, COOLDOWN_SIZE, z)
+  if not valid(slot) then image:RemoveFromParent(); return nil end
+  image:SetVisibility(VIS.Collapsed)
+  image:SetRenderTransformPivot({ X = 0, Y = 0 })
+  if colour ~= nil then image:SetColorAndOpacity(colour) end
+  if opacity ~= nil then image:SetRenderOpacity(opacity) end
+  local brush = {
+    DrawAs = 3, ImageSize = { X = COOLDOWN_SIZE, Y = COOLDOWN_SIZE },
+    TintColor = { SpecifiedColor = ICON_WHITE, ColorUseRule = 0 },
+    ResourceObject = resource, UVRegion = region,
+  }
+  image:SetBrush(brush)
+  return image, slot, brush
+end
+
+function Icons:buildCooldown()
+  if self.S.WeaponCooldown == false or self.cooldownAttempted then return end
+  local pc = playerController()
+  local library = cls('/Script/Engine.Default__KismetRenderingLibrary')
+  if not (valid(pc) and valid(library)) then return end
+  self.cooldownAttempted = true
+  local ok, resource = pcall(function() return library:ImportFileAsTexture2D(pc, COOLDOWN_ART) end)
+  if not ok or not valid(resource) then
+    self.log('cooldown atlas import failed: ' .. tostring(resource))
+    return
+  end
+  -- 底轨是可选层：它建不出来就只显示弧线，不能让整个 CD 条消失。
+  local back = self:cooldownLayer(resource, 'PBZMoHUD_Icons_CDTrack', COOLDOWN_BACK_Z,
+    COOLDOWN_TRACK_REGION, COOLDOWN_BACK, COOLDOWN_BACK_OPACITY)
+  local image, slot, brush = self:cooldownLayer(resource, 'PBZMoHUD_Icons_CD',
+    COOLDOWN_Z, COOLDOWN_REGIONS[1])
+  if image == nil then
+    if back ~= nil then back:RemoveFromParent() end
+    return
+  end
+  -- 两层共用一套平移与缩放，变更时按这个列表刷一遍，省掉逐层写死的三份判断。
+  -- 列表顺序即绘制顺序：底轨在前，弧线在后。
+  local layers = { image }
+  if back ~= nil then layers = { back, image } end
+  self.cooldown = {
+    panel = image, slot = slot, brush = brush, layers = layers,
+    geometry = {}, offset = 0, width = COOLDOWN_SIZE, paintedFrame = 1,
+  }
+end
+
+function Icons:layoutCooldown(vw, vh)
+  local entry = self.cooldown
+  self.cooldownVisible = false
+  if not entry then return end
+  entry.shown, entry.preview = false, false
+  if self.S.WeaponCooldown == false then return end
+  local ratio = self.cooldownRatio
+  if self.dragTipVisible then
+    entry.preview = true
+    ratio = 1
+  elseif self.cooldownPreviewTime ~= nil then
+    entry.preview = true
+    ratio = math.floor(self.cooldownPreviewTime / 3 * (COOLDOWN_STEPS + 1)) / COOLDOWN_STEPS
+  end
+  if ratio == nil or ratio <= 0 then return end
+  if not entry.preview then
+    -- 只有确认在走的冷却才画：残留值会让整圈环永远挂在 HUD 上。
+    local movedAt = self.cooldownMovedAt
+    if self.cooldownArmed ~= true or movedAt == nil
+      or os.clock() - movedAt > COOLDOWN_STALL then return end
+    -- 最后一格已经是一整圈，画面与「没有冷却」相同，不必再画一层。
+    if cooldownFrame(ratio) >= COOLDOWN_STEPS then return end
+  end
+  entry.shown = true
+  self.cooldownVisible = true
+  entry.ratio = ratio
+  entry.width = px(COOLDOWN_SIZE, self:scale())
+  local x, y = tonumber(self.S.WeaponCooldownX) or -1, tonumber(self.S.WeaponCooldownY) or -1
+  if x == -1 or y == -1 then
+    local scale = self.arcScale or 1
+    local changed = entry.layoutScale ~= scale or entry.layoutWidth ~= entry.width
+    for _, key in ipairs(COOLDOWN_GEOMETRY) do
+      if entry.geometry[key] ~= self.S[key] then changed = true; entry.geometry[key] = self.S[key] end
+    end
+    if changed then
+      local style = ArcStyle.resolve(self.S, 'qi')
+      local distance = style.radius - style.thickness / 2 - (entry.width / 2 + 8) / scale
+      local ox, oy = ArcStyle.point(style, style.side == 'left' and 180 or 0, distance)
+      entry.ox, entry.oy = ox * scale - entry.width / 2, oy * scale - entry.width / 2
+      entry.layoutScale, entry.layoutWidth = scale, entry.width
+    end
+    if x == -1 then x = (self.anchorX or vw / 2) + entry.ox end
+    if y == -1 then y = (self.anchorY or vh * 0.55) + entry.oy end
+  end
+  self.cooldownX, self.cooldownY = x, y
+end
+
+function Icons:placeCooldown()
+  local entry = self.cooldown
+  if not entry then return end
+  if entry.paintedVisible ~= entry.shown then
+    local visibility = entry.shown and VIS.HitTestInvisible or VIS.Collapsed
+    for _, layer in ipairs(entry.layers) do layer:SetVisibility(visibility) end
+    entry.paintedVisible = entry.shown
+    -- 真实冷却的显隐每段只发生两次，留一行就能事后对照 CDRatio 的读数，
+    -- 而预览会循环，不能跟着写日志。
+    if not entry.preview then
+      self.log(string.format('cooldown ring %s progress=%.3f',
+        entry.shown and 'on' or 'off', self.cooldownRatio or 0))
+    end
+  end
+  if not entry.shown then return end
+  if entry.x ~= self.cooldownX or entry.y ~= self.cooldownY then
+    for _, layer in ipairs(entry.layers) do
+      layer:SetRenderTranslation({ X = self.cooldownX, Y = self.cooldownY })
+    end
+    entry.x, entry.y = self.cooldownX, self.cooldownY
+  end
+  if entry.size ~= entry.width then
+    local scale = entry.width / COOLDOWN_SIZE
+    for _, layer in ipairs(entry.layers) do layer:SetRenderScale({ X = scale, Y = scale }) end
+    entry.size = entry.width
+  end
+  local frame = cooldownFrame(entry.ratio)
+  if entry.paintedFrame == frame then return end
+  entry.brush.UVRegion = COOLDOWN_REGIONS[frame]
+  entry.panel:SetBrush(entry.brush)
+  entry.paintedFrame = frame
 end
 
 function Icons:destroy()
@@ -585,10 +959,12 @@ function Icons:destroy()
 end
 
 function Icons:destroyTree()
+  self:releaseNative()
   if self.root ~= nil and valid(self.root) then
     pcall(function() self.root:RemoveFromParent() end)
   end
   self.root, self.tree, self.canvas = nil, nil, nil
+  self.cooldown, self.cooldownAttempted = nil, nil
   self.dragTip, self.tipPaintedText, self.tipPaintedVisible = nil, nil, nil
   self.dragTipVisible = false
   self.medEntries = {}
@@ -601,8 +977,29 @@ end
 -- update 立刻重新扫描。这里只改 Lua 字段，不调用任何 UMG 函数 —— 旧控件可能正在
 -- 被销毁，这时候去碰它就是踩野指针。
 function Icons:forget()
-  self.quickslot, self.weapon = nil, nil
-  self.bulletNum = nil
+  -- 前端 HUD 可能跨世界存活；只留名称和值，恢复后重新取句柄，不能保留旧 UObject。
+  for name, record in pairs(self.nativeHidden or {}) do
+    if name ~= '?' then
+      self.nativeRestore = self.nativeRestore or {}
+      self.nativeRestore[name] = record.was
+    end
+  end
+  self.nativeHidden, self.nativeScanAt, self.nativeSignature = nil, nil, nil
+  self.quickslot, self.weapon, self.backpack = nil, nil, nil
+  for _, entry in ipairs(self.ultEntries) do
+    entry.weaponReady = false
+    if entry.weaponIcon then
+      entry.weaponIcon.resource = nil
+      -- 充能层的 mid 可能就是游戏自己的材质实例，和控件一样属于旧世界。
+      entry.weaponIcon.fill = nil
+      entry.weaponIcon.fillRetryAt = nil
+    end
+  end
+  self.bulletNum, self.cooldownRatio = nil, nil
+  self.cooldownArmed, self.cooldownMovedAt = nil, nil
+  self.cooldownPreviewTime, self.cooldownPreviewStart = nil, nil
+  self.anchorX, self.anchorY, self.arcScale = nil, nil, nil
+  self.cooldownVisible = false
   self.scanAt, self.readAt = -1, -1
   self.viewportAt, self.viewportCache = -1, nil
   self.shownValue = nil
@@ -616,12 +1013,108 @@ end
 -- 下一次 update 会重新 build() 一整套控件；拖动遮罩由 syncDim() 按需重建。
 function Icons:forgetWidgets()
   self.root, self.tree, self.canvas, self.layer = nil, nil, nil, nil
+  self.cooldown, self.cooldownRatio, self.cooldownVisible = nil, nil, false
+  self.cooldownArmed, self.cooldownMovedAt, self.cooldownAttempted = nil, nil, nil
+  self.cooldownPreviewTime, self.cooldownPreviewStart = nil, nil
+  self.anchorX, self.anchorY, self.arcScale = nil, nil, nil
   self.dragTip, self.tipPaintedText, self.tipPaintedVisible = nil, nil, nil
   self.dimRoot, self.dimPainted = nil, nil
   self.medEntries, self.ultEntries = {}, {}
   self.scanAt, self.readAt, self.buildAt = -1, -1, 0
   self.viewportAt, self.viewportCache = -1, nil
   self.shownValue, self.shownOpacity, self.rootShown = nil, nil, nil
+end
+
+local function restoreNative(record)
+  if valid(record.widget) and prop(record.widget, 'Visibility') == VIS.Hidden then
+    pcall(function() record.widget:SetVisibility(record.was) end)
+  end
+end
+
+function Icons:recoverNative()
+  if Util.mapGuard() then return end
+  local pending = self.nativeRestore
+  if not pending then return end
+  self.nativeRestore = nil
+  local function restore(widget)
+    local was = pending[fullName(widget)]
+    if was ~= nil then restoreNative({ widget = widget, was = was }) end
+  end
+  for _, shortName in ipairs({ 'WB_quickslot_C', 'W_WeaponUI_C' }) do
+    local ok, list = pcall(function() return FindAllOf(shortName) end)
+    if ok and type(list) == 'table' then
+      for _, widget in ipairs(list) do
+        if shortName == 'WB_quickslot_C' then
+          restore(widget)
+        elseif valid(widget) then
+          restore(unwrap(prop(widget, 'Overlay_WeaponIcon')))
+          restore(unwrap(prop(widget, 'ShaqiWeapon')))
+        end
+      end
+    end
+  end
+end
+
+function Icons:releaseNative()
+  if Util.mapGuard() then return end
+  if self.nativeRestore then self:recoverNative() end
+  local hidden = self.nativeHidden
+  self.nativeHidden, self.nativeScanAt, self.nativeSignature = nil, nil, nil
+  if not hidden then return end
+  for _, record in pairs(hidden) do restoreNative(record) end
+end
+
+function Icons:updateNative(now)
+  if Util.mapGuard() then return end
+  if self.nativeRestore then self:recoverNative() end
+  local hideAll = self.S.HideNativeHud == true
+  local medicine = hideAll or self.S.HideNativeMedicine == true
+  local main = hideAll or self.S.HideNativeMainWeapon == true
+  local shaqi = hideAll or self.S.HideNativePhantomEdges == true
+  if not (medicine or main or shaqi) then
+    if self.nativeHidden then self:releaseNative() end
+    return
+  end
+  local signature = (medicine and 1 or 0) + (main and 2 or 0) + (shaqi and 4 or 0)
+  if signature ~= self.nativeSignature or now >= (self.nativeScanAt or 0) then
+    self.nativeSignature, self.nativeScanAt = signature, now + SCAN_INTERVAL
+    local previous, hidden = self.nativeHidden or {}, {}
+    local function bind(widget)
+      if not valid(widget) then return end
+      local name = fullName(widget)
+      local record = previous[name] or { was = prop(widget, 'Visibility') }
+      if record.was == nil then return end
+      record.widget = widget
+      hidden[name] = record
+    end
+    if medicine then
+      self.quickslot = findLive('WB_quickslot_C', QUICK_CHILDREN)
+      bind(self.quickslot)
+    end
+    if main or shaqi then
+      local weapon = findLive('W_WeaponUI_C', { 'Overlay_WeaponIcon', 'ShaqiWeapon' })
+      if weapon ~= self.weapon then self.bulletNum = nil end
+      self.weapon = weapon
+      if main then bind(unwrap(prop(weapon, 'Overlay_WeaponIcon'))) end
+      if shaqi then bind(unwrap(prop(weapon, 'ShaqiWeapon'))) end
+    end
+    for name, record in pairs(previous) do
+      if not hidden[name] then restoreNative(record) end
+    end
+    self.nativeHidden = hidden
+  end
+  for _, record in pairs(self.nativeHidden) do
+    local widget = record.widget
+    if valid(widget) then
+      local visibility = prop(widget, 'Visibility')
+      if visibility ~= nil and visibility ~= VIS.Hidden then
+        record.was = visibility
+        if visibility ~= VIS.Collapsed then
+          pcall(function() widget:SetVisibility(VIS.Hidden) end)
+        end
+      end
+    end
+  end
 end
 
 function Icons:scan()
@@ -636,19 +1129,28 @@ function Icons:scan()
   if self.S.MedicineHud ~= false then
     self.quickslot = adopt(self.quickslot, 'WB_quickslot_C', QUICK_CHILDREN, 'quick')
   end
-  if self.S.PureIcon ~= false or self.S.BulletIcon ~= false then
+  if self.S.PureIcon ~= false or self.S.BulletIcon ~= false or self.S.WeaponCooldown ~= false then
     local previous = self.weapon
-    local names = self.S.PureIcon ~= false and PURE_CHILDREN or BULLET_CHILDREN
+    local names = self.S.PureIcon ~= false and PURE_CHILDREN
+      or (self.S.BulletIcon ~= false and BULLET_CHILDREN or { 'cd2', 'Circle', 'Circle_2' })
     self.weapon = adopt(self.weapon, 'W_WeaponUI_C', names, 'weapon')
     if self.weapon ~= previous then self.bulletNum = nil end
   end
+  if ((self.S.PureIcon ~= false and self.S.MainWeaponIcon ~= false)
+    or (self.S.BulletIcon ~= false and self.S.PhantomEdgesIcon ~= false)) and not valid(self.backpack) then
+    local pc = playerController()
+    if valid(pc) then
+      self.backpack = Util.call(cls('/Script/ProjectPBZ.Default__PBZBackPackSubsystem'), 'GetBackPackSubsytemByContextObject', pc)
+    end
+  end
+  if self.S.WeaponCooldown ~= false and not self.cooldown then self:buildCooldown() end
 end
 
-local function slotState(icon, num)
+local function slotState(icon, num, hidden)
   local info = valid(icon) and brushInfo(icon) or nil
   -- chainVisible 自己会先校验控件，这里不再重复 valid。
-  local iconOn = chainVisible(icon)
-  local numOn = chainVisible(num)
+  local iconOn = chainVisible(icon, hidden)
+  local numOn = chainVisible(num, hidden)
   local text = valid(num) and textValue(prop(num, 'Text')) or nil
   local count = nil
   if type(text) == 'string' then
@@ -769,6 +1271,29 @@ function Icons:applyValue(entry, text, live, iconOn)
   self:applyTextColour(entry)
 end
 
+-- CDRatio 是剩余冷却比例，图集使用已完成比例。除了折算进度，这里还要判断
+-- 「到底有没有在冷却」：游戏的这个值是动画参数，HUD 重建 / 重新显示之后可能
+-- 一步跳到某个非零值上停住，静止或只跳一次的读数都不能画成环。
+function Icons:trackCooldown(remaining)
+  local completed = nil
+  if remaining and remaining == remaining then
+    completed = 1 - math.max(0, math.min(1, remaining))
+  end
+  local previous, now = self.cooldownRatio, os.clock()
+  self.cooldownRatio = completed
+  -- 空读数、刚开始（0 格）和已经读满（最后一格）都不在冷却中：清掉「已确认
+  -- 在走」，下一段冷却要重新证明自己，残留值不能沿用上一次的结论。
+  if completed == nil or completed <= 0 or cooldownFrame(completed) >= COOLDOWN_STEPS then
+    self.cooldownArmed, self.cooldownMovedAt = nil, nil
+    return
+  end
+  if previous == nil or math.abs(completed - previous) <= COOLDOWN_MOVE_EPS then return end
+  -- 相邻两次读数都在动才算冷却：残留值是单次跳变，不该点亮整圈环。
+  self.cooldownArmed = self.cooldownArmed == true
+    or (self.cooldownMovedAt ~= nil and now - self.cooldownMovedAt <= COOLDOWN_STALL)
+  self.cooldownMovedAt = now
+end
+
 function Icons:read()
   local q = self.quickslot
   if self.S.MedicineHud == false then
@@ -777,7 +1302,7 @@ function Icons:read()
     -- 先 BottomMedicineNum，再 TopMedicineNum。
     if self.medEntries[1] ~= nil then
       local num = unwrap(prop(q, 'BottomMedicineNum'))
-      local state = slotState(unwrap(prop(q, 'Icon')), num)
+      local state = slotState(unwrap(prop(q, 'Icon')), num, self.nativeHidden)
       -- 未绑定的前端副本会在 IconBrush 里带一个菜单图标笔刷，所以
       -- 该属性只在槽位本身存活时才作为后备。
       if state.info == nil and valid(num) then
@@ -787,7 +1312,7 @@ function Icons:read()
     end
     if self.medEntries[2] ~= nil then
       self:applySlot(self.medEntries[2], slotState(
-        unwrap(prop(q, 'Icon_next')), unwrap(prop(q, 'TopMedicineNum'))))
+        unwrap(prop(q, 'Icon_next')), unwrap(prop(q, 'TopMedicineNum')), self.nativeHidden))
     end
   else
     for _, entry in ipairs(self.medEntries) do
@@ -800,10 +1325,11 @@ function Icons:read()
     if valid(w) then
       local pureNum = unwrap(prop(w, 'PureShachiNum'))
       self:applyValue(self.ultEntries[1], textValue(prop(pureNum, 'Text')),
-        chainVisible(pureNum), iconPresent(pureNum, unwrap(prop(w, 'PureShachiImage'))))
+        chainVisible(pureNum, self.nativeHidden), iconPresent(pureNum, unwrap(prop(w, 'PureShachiImage')), self.nativeHidden))
     else
       self:applyValue(self.ultEntries[1], nil)
     end
+    self:readWeapon(self.ultEntries[1], true)
   end
   if self.S.BulletIcon ~= false and self.ultEntries[2] then
     if valid(w) then
@@ -812,12 +1338,16 @@ function Icons:read()
         self.bulletNum = unwrap(prop(w, 'BulletNum')) or self:childNamed(w, 'BulletNum')
       end
       self:applyValue(self.ultEntries[2], textValue(prop(self.bulletNum, 'Text')),
-        chainVisible(self.bulletNum), iconPresent(self.bulletNum, nil))
+        chainVisible(self.bulletNum, self.nativeHidden), iconPresent(self.bulletNum, nil, self.nativeHidden))
     else
       self:applyValue(self.ultEntries[2], nil)
     end
+    self:readWeapon(self.ultEntries[2], false)
   end
 
+  if self.S.WeaponCooldown ~= false then
+    self:trackCooldown(valid(w) and tonumber(prop(w, 'CDRatio')) or nil)
+  end
   if self.S.Debug then
     local parts = {}
     for index, entry in ipairs(self.medEntries) do
@@ -896,6 +1426,17 @@ function Icons:computeLayout()
     local enabled = (index == 1 and S.PureIcon ~= false)
       or (index == 2 and S.BulletIcon ~= false)
     entry.shown = enabled and entry.hasValue
+    entry.useWeapon = entry.shown and entry.weaponReady == true
+      and S[index == 1 and 'MainWeaponIcon' or 'PhantomEdgesIcon'] ~= false
+    if entry.useWeapon then
+      local ratio = entry.weaponIcon.ratio
+      local size = px(WEAPON_SIZE, sc)
+      local w, h = size, size
+      if ratio > 1 then h = px(size / ratio, 1) else w = px(size * ratio, 1) end
+      entry.weaponW, entry.weaponH = w, h
+      local bounds = math.ceil((w + h) * ROTATION_UNIT)
+      entry.iconW, entry.iconH = bounds, bounds
+    end
     if entry.shown then
       local numW = entry.showNum and math.max(minNumW, charW * #entry.numText) or 0
       entry.numW = math.floor(numW)
@@ -935,6 +1476,7 @@ function Icons:computeLayout()
   self.ultY = ultAutoY and yDefault or (tonumber(S.UltHudY) or 0)
   self.medW, self.ultW = medW, ultW
   self.medVisible, self.ultVisible = medVisible, ultVisible
+  self:layoutCooldown(vw, vh)
 end
 
 function Icons:entryOff(entry)
@@ -951,14 +1493,14 @@ end
 
 -- 面板的矩形是图标的底部切片，所以里面的副本要向上偏移
 -- 恰好是切片略去的高度，从而与下面的图标对齐；其余部分由
--- 裁剪切掉。副本保持全亮，于是充能部分看起来就是普通着色
--- 的图标，其余部分保留游戏自身的变暗效果。
+-- 裁剪切掉。副本按 entry.tint 着色（绝招图标是紫色），于是充能
+-- 部分看起来就是染色后的图标，其余部分保留游戏自身的变暗效果。
 function Icons:placeFill(entry, x, y)
   local fill = entry.fill
   if fill == nil then return end
   local ratio = tonumber(self.ultRatio)
   local active = ratio ~= nil and self.S.PureIcon ~= false and self.S.UltChargeBar ~= false
-  local show = entry.shown and active and entry.iconW > 0
+  local show = entry.shown and not entry.useWeapon and active and entry.iconW > 0
   local h = math.floor(entry.iconH)
   local fillH = show and math.floor(h * math.max(0, math.min(1, ratio)) + 0.5) or 0
   if fillH <= 0 then
@@ -1003,6 +1545,7 @@ function Icons:placeEntry(entry, gx, gy)
       entry.lastImageVis, entry.lastTextVis = nil, nil
     end
     self:placeFill(entry, 0, 0)
+    self:placeWeapon(entry, 0, 0)
     return
   end
   local ox, oy = self:entryOff(entry)
@@ -1010,7 +1553,7 @@ function Icons:placeEntry(entry, gx, gy)
   local y = gy + oy
   local rowH = self.rowH
   local artX = x
-  if entry.iconW > 0 then
+  if entry.iconW > 0 and not entry.useWeapon then
     local h = entry.iconH
     local iconY = self:artTop(entry, y)
     if entry.lastPx ~= x or entry.lastPy ~= y or entry.lastW ~= entry.iconW
@@ -1031,6 +1574,7 @@ function Icons:placeEntry(entry, gx, gy)
   else
     if entry.lastImageVis ~= false then
       entry.lastImageVis = false
+      entry.lastW = nil
       pcall(function() entry.image:SetVisibility(VIS.Collapsed) end)
     end
   end
@@ -1059,6 +1603,7 @@ function Icons:placeEntry(entry, gx, gy)
   end
   entry.lastPx, entry.lastPy = x, y
   self:placeFill(entry, x, y)
+  self:placeWeapon(entry, x, y)
 end
 
 function Icons:applyPositions()
@@ -1068,6 +1613,7 @@ function Icons:applyPositions()
   for _, entry in ipairs(self.ultEntries) do
     self:placeEntry(entry, self.ultX, self.ultY)
   end
+  self:placeCooldown()
 end
 
 function Icons:syncRootVisibility()
@@ -1160,9 +1706,15 @@ end
 function Icons:update(dt, ctx)
   ctx = ctx or {}
   local now = os.clock()
-  local off = self.S.MedicineHud == false and self.S.PureIcon == false and self.S.BulletIcon == false
+  local off = self.S.MedicineHud == false and self.S.PureIcon == false
+    and self.S.BulletIcon == false and self.S.WeaponCooldown == false
+  if self.S.WeaponCooldown == false then
+    self.cooldownRatio, self.cooldownArmed, self.cooldownMovedAt = nil, nil, nil
+    self.cooldownPreviewTime, self.cooldownPreviewStart = nil, nil
+  end
   if off then
-    self.medVisible, self.ultVisible = false, false
+    self:updateNative(now)
+    self.medVisible, self.ultVisible, self.cooldownVisible = false, false, false
     self.ultRatio = nil
     self:setShown(false, 0)
     if not self.dragTipVisible then
@@ -1178,12 +1730,13 @@ function Icons:update(dt, ctx)
       self.buildAt = now + 1.0
       self:build()
     end
-    if not valid(self.root) then return end
+    if not valid(self.root) then self:updateNative(now); return end
   end
 
   self:showDragTip(nil, self.dragTipVisible)
-  if off then self:setShown(false, 0); return end
+  if off then self:setShown(false, 0); self:updateNative(now); return end
 
+  self:updateNative(now)
   if now - self.scanAt >= SCAN_INTERVAL then
     self.scanAt = now
     self:scan()
@@ -1193,8 +1746,20 @@ function Icons:update(dt, ctx)
     self:read()
   end
 
+  if self.S.WeaponCooldown ~= false then
+    -- 预览只在面板真的打开时跑：temp 态（收起面板继续玩）要看到真实冷却，
+    -- 否则预览会一直循环，环永远挂在 HUD 上。
+    if ctx.preview and not self.dragTipVisible then
+      self.cooldownPreviewStart = self.cooldownPreviewStart or now
+      self.cooldownPreviewTime = (now - self.cooldownPreviewStart) % 3
+    else
+      self.cooldownPreviewTime, self.cooldownPreviewStart = nil, nil
+    end
+    self.anchorX, self.anchorY = ctx.anchorX, ctx.anchorY
+    self.arcScale = tonumber(ctx.arcScale) or 1
+  end
   self:computeLayout()
-  local any = self.medVisible or self.ultVisible
+  local any = self.medVisible or self.ultVisible or self.cooldownVisible
   -- 读数跟随弧线的显示设置；dynamic 的满值隐藏属于进度条，
   -- 所以这里 dynamic 的行为与 hud 一致。ctx.hudFade 携带 HUD 自身的
   -- 透明度，使渐隐的 HUD 会带着读数一起淡出，而不是让它们
@@ -1209,21 +1774,26 @@ local function inRect(x, y, rx, ry, rw, rh)
 end
 
 function Icons:groupOrigin(group)
+  if group == 'cooldown' then return self.cooldownX, self.cooldownY, self.cooldown.width end
   if group == 'med' then return self.medX, self.medY, self.medW end
   return self.ultX, self.ultY, self.ultW
 end
 
 function Icons:groupEntries(group)
+  if group == 'cooldown' then return self.cooldown and { self.cooldown } or {} end
   return (group == 'med') and self.medEntries or self.ultEntries
 end
 
 -- 让某个组保持在屏幕内，并把它的位置写回设置。
 function Icons:setGroupAt(group, x, y)
   local vw, vh = self:viewport()
-  local width = (group == 'med') and self.medW or self.ultW
+  local _, _, width = self:groupOrigin(group)
   local nx = math.max(-width + 20, math.min(vw - 20, x))
   local ny = math.max(0, math.min(vh - 10, y))
-  if group == 'med' then
+  if group == 'cooldown' then
+    self.cooldownX, self.cooldownY = nx, ny
+    self.S.WeaponCooldownX, self.S.WeaponCooldownY = math.floor(nx + 0.5), math.floor(ny + 0.5)
+  elseif group == 'med' then
     self.medX, self.medY = nx, ny
     self.S.MedicineHudX, self.S.MedicineHudY = math.floor(nx + 0.5), math.floor(ny + 0.5)
   else
@@ -1236,6 +1806,12 @@ end
 function Icons:hitAt(x, y)
   local sc = self:scale()
   local padX, padY = px(4, sc), px(7, sc)
+  if self.cooldownVisible and self.S.WeaponCooldown ~= false then
+    local cx, cy, size = self:groupOrigin('cooldown')
+    if inRect(x, y, cx - padX, cy - padY, size + padX * 2, size + padY * 2) then
+      return 'cooldown', self.cooldown, cx, cy
+    end
+  end
   local groups = {
     { name = 'med', entries = self.medEntries, shown = self.medVisible },
     { name = 'ult', entries = self.ultEntries, shown = self.ultVisible },
@@ -1249,6 +1825,14 @@ function Icons:hitAt(x, y)
           local ex, ey = gx + entry.offset + ox, gy + oy
           if inRect(x, y, ex - padX, ey - padY, entry.width + 2 * padX, self.rowH + 2 * padY) then
             return candidate.name, entry, ex, ey
+          end
+          if entry.weaponReady and entry.weaponIcon and entry.weaponIcon.shown then
+            local wx, wy, w, h = self:weaponRect(entry, ex, ey)
+            local dx, dy = x - wx - w / 2, y - wy - h / 2
+            local ux, uy = (dx - dy) * ROTATION_UNIT + w / 2, (dx + dy) * ROTATION_UNIT + h / 2
+            if inRect(ux, uy, -padX, -padY, w + 2 * padX, h + 2 * padY) then
+              return candidate.name, entry, ex, ey
+            end
           end
         end
       end

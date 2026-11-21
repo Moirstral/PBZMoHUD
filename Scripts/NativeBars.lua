@@ -76,6 +76,7 @@ local VIS, Z = Util.VIS, Util.Z
 -- 'hide' 也按固定长度处理：条虽然不画，读数的位置仍按固定后的长度算，
 -- 和开着固定时的观感一致。
 local function nativeMode(settings)
+  if settings.HideNativeHud then return 'hide' end
   local mode = tostring(settings.NativeBars or 'pin'):lower()
   if mode ~= 'dynamic' and mode ~= 'hide' then mode = 'pin' end
   return mode

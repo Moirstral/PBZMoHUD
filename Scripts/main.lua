@@ -88,28 +88,10 @@ local function widgetChainVisible(widget, skipViewportCheck)
   return factor > 0.01, factor, false
 end
 
--- HUD 显隐探测。FindAllOf 要遍历全部 UObject，是全 MOD 单次最贵的操作，
--- 而 hudVisible() 常态下每秒要问 20 次，所以候选控件只扫描一次并留下清单。
---
--- 两件事必须分开记：
---   · 清单（留一次扫描结果）可以缓存，否则每帧都要遍历全部 UObject；
---   · 结论（此刻算不算显示）绝不能缓存，游戏换 HUD 实例之后旧实例往往仍然
---     valid()、类名也对，只是已经离场，父链不透明度恒为 0 —— 一旦把「上次选中
---     的那个控件」当成结论钉死，「HUD 隐藏」就再也不变，弧线和图标只在菜单
---     打开（强制显示）时才出现。
---
--- 分层是硬要求：血条控件命中就用血条控件，只有它一个有效实例都没有时才退到
--- 前台布局。两者不能放进同一个「或」里 —— 前台布局在游戏里常驻可见，混在
--- 一起会让 MOD 永远认为 HUD 在显示，从而不再跟着 HUD 一起隐藏。
-local HUD_TIERS = { 'WB_PlayerHPBar_V1_C', 'W_FrontEndHUDLayout_C' }
--- 隐藏状态下重扫清单的最小间隔。只有「清单空了 / 候选失效 / PC-Pawn 换了 /
--- 隐藏超过 HUD_LIST_TTL」才重扫，光「这一刻不可见」不算理由 —— 否则常态满血
--- 隐藏时每秒要扫 4~5 次，既浪费又正好和读档换世界撞在一起。
-local HUD_RESCAN_GAP = 0.25
-local HUD_LIST_TTL = 1.0
+local HUD_SOURCE_INTERVAL = 0.5
 -- 关卡加载期间完全不碰游戏控件：这时候旧世界的 UObject 正在被销毁，
 -- 读它们的属性会直接崩在引擎里（crash dump 就是 UE4SS 层的 ACCESS_VIOLATION，
--- 读到的地址是野指针）。PreHook 一进来就清空清单并挂起探测，
+-- 读到的地址是野指针）。PreHook 一进来就清空引用并挂起探测，
 -- PostHook 恢复；万一 PostHook 没来，最多 LOAD_GUARD_MAX 秒后自动解开。
 local LOAD_GUARD_MAX = 20
 -- PostHook 之后新世界的 UMG 还在搭建，且引擎的垃圾回收往往在这之后才把旧世界的
@@ -125,9 +107,7 @@ local LOAD_SETTLE = 1.0
 -- HUD 一出现就是安全的，所以当帧放行。
 -- 兜底时长：停在主界面 / 菜单里 HUD 一直不出现时，不能让重模块永远不干活。
 local SETTLE_FALLBACK = 10.0
-local hudPick = { tiers = { {}, {} }, count = 0, at = -HUD_RESCAN_GAP, ready = false,
-  dirty = true, stale = false, loading = false, loadingAt = 0, settleAt = 0,
-  pc = nil, pawn = nil }
+local hudSource = { nextAt = 0, loading = false, settleAt = 0 }
 -- 重模块（图标 / 原生条）是否已恢复；heavyHeld 记录「上锁时已经把图标收过一次」。
 local heavyReady, heavyHeld = true, false
 
@@ -145,136 +125,295 @@ local PRELOAD_HOLD = 1.5
 local MAP_GUARD_EXTRA = 1.5
 local mapFreeze = { preUntil = 0, hard = false, at = 0, source = '' }
 local mapGuardUntil = 0
+local nativePreview = { nextAt = 0 }
 
-local function clearHudPick()
-  for t = 1, #hudPick.tiers do
-    local tier = hudPick.tiers[t]
-    for i = #tier, 1, -1 do tier[i] = nil end
+local function previewStatus(status)
+  if debugOn and nativePreview.status ~= status then
+    nativePreview.status = status
+    log('native HUD preview: ' .. status)
   end
-  hudPick.count, hudPick.ready, hudPick.dirty, hudPick.stale = 0, false, true, false
-  hudPick.pc, hudPick.pawn = nil, nil
 end
 
-local function collectTier(cls, pcName, out)
-  local ok, list = pcall(function() return FindAllOf(cls) end)
-  if not ok or type(list) ~= 'table' then return end
-  local items, scores = {}, {}
-  for _, widget in ipairs(list) do
-    if valid(widget) then
-      local okN, name = pcall(function() return widget:GetFullName() end)
-      if okN and type(name) == 'string' and not name:find('Default__', 1, true) then
-        -- 打分只用来排顺序：属于本机 PlayerController 的优先（2 分），
-        -- 此刻没被 Collapsed/Hidden 的次之（1 分）。是否真的可见由 probeTier
-        -- 逐个走父链确认，这个启发式不参与结论。
-        local score = 0
-        if pcName ~= nil then
-          local okO, owner = pcall(function() return widget:GetOwningPlayer() end)
-          if okO and valid(owner) then
-            local okON, ownerName = pcall(function() return owner:GetFullName() end)
-            if okON and ownerName == pcName then score = 2 end
-          end
-        end
-        local okV, vis = pcall(function() return widget.Visibility end)
-        if okV and not (vis == VIS.Collapsed or vis == VIS.Hidden) then
-          score = score + 1
-        end
-        items[#items + 1] = widget
-        scores[#scores + 1] = score
+local function releaseNativePreview(immediate)
+  local record = nativePreview.record
+  if not record then return true end
+  if Util.mapGuard() then nativePreview.record = nil; return true end
+  local now = os.clock()
+  if not immediate and record.releaseAt and now < record.releaseAt then return false end
+  local pendingRestore = false
+  for _, item in ipairs(record.items) do
+    if item.applied then
+      if not valid(item.widget) or prop(item.widget, 'RenderOpacity') ~= 1 then
+        item.applied = false
+      elseif pcall(function() item.widget:SetRenderOpacity(item.was) end) then
+        item.applied = false
+      else
+        pendingRestore = true
+      end
+    end
+    if item.visibilityApplied then
+      if not valid(item.widget) or prop(item.widget, 'Visibility') ~= VIS.SelfHitTestInvisible then
+        item.visibilityApplied = false
+      elseif pcall(function() item.widget:SetVisibility(item.wasVisibility) end)
+          and prop(item.widget, 'Visibility') == item.wasVisibility then
+        item.visibilityApplied = false
+      else
+        pendingRestore = true
       end
     end
   end
-  -- 插入排序按分数降序。候选只有个位数，不值得为它起一个比较闭包。
-  for i = 2, #items do
-    local widget, score = items[i], scores[i]
-    local j = i - 1
-    while j >= 1 and scores[j] < score do
-      items[j + 1], scores[j + 1] = items[j], scores[j]
-      j = j - 1
+  if not pendingRestore then nativePreview.record = nil; return true end
+  if not record.releaseAt then alert('native HUD preview: restore failed') end
+  record.releaseAt = now + 0.5
+  return false
+end
+
+local function previewFadeTargets(layout)
+  local animation = unwrap(prop(layout, 'hudhide'))
+  if not valid(animation) then return nil end
+  local bindings = prop(animation, 'AnimationBindings')
+  if bindings == nil then return nil end
+  local items, seen = {}, {}
+  local ok = pcall(function()
+    for i = 1, #bindings do
+      local binding = unwrap(bindings[i])
+      if prop(binding, 'bIsRootWidget') ~= true then
+        local widgetName = unwrap(prop(binding, 'WidgetName'))
+        local name = type(widgetName) == 'string' and widgetName or widgetName:ToString()
+        local widget = unwrap(prop(layout, name))
+        local full = Util.call(widget, 'GetFullName')
+        local opacity = prop(widget, 'RenderOpacity')
+        if full and not seen[full] and type(opacity) == 'number' then
+          seen[full] = true
+          items[#items + 1] = { widget = widget, was = opacity, visibilityTarget = name == 'playerhud' }
+        end
+      end
     end
-    items[j + 1], scores[j + 1] = widget, score
-  end
-  for i = 1, #items do out[i] = items[i] end
+  end)
+  if not ok or #items == 0 then return nil end
+  return items
 end
 
-local function buildHudList()
-  local pc = localPC()
-  local pcName = nil
-  if valid(pc) then
-    local ok, name = pcall(function() return pc:GetFullName() end)
-    if ok then pcName = name end
-  end
-  local total = 0
-  for t = 1, #HUD_TIERS do
-    local tier = hudPick.tiers[t] or {}
-    for i = #tier, 1, -1 do tier[i] = nil end
-    collectTier(HUD_TIERS[t], pcName, tier)
-    hudPick.tiers[t] = tier
-    total = total + #tier
-  end
-  hudPick.count, hudPick.at, hudPick.ready = total, os.clock(), true
-  hudPick.dirty = false
-  hudPick.pc, hudPick.pawn = pc, prop(pc, 'Pawn')
-  if debugOn then
-    log('hud pick: ' .. #hudPick.tiers[1] .. '+' .. #hudPick.tiers[2] .. ' candidate(s)')
-  end
+local function previewSnapshot(record, phase)
+  if not debugOn or Util.mapGuard() then return end
+  local ok, err = pcall(function()
+    local function text(value)
+      value = unwrap(value)
+      if value == nil or type(value) == 'string' or type(value) == 'number' or type(value) == 'boolean' then
+        return tostring(value)
+      end
+      local named, name = pcall(function() return value:ToString() end)
+      return named and tostring(name) or tostring(value)
+    end
+    local function chain(label, widget)
+      local nodes, seen = {}, {}
+      for _ = 1, 8 do
+        if not valid(widget) then nodes[#nodes + 1] = 'invalid'; break end
+        local name = Util.call(widget, 'GetFullName') or '?'
+        if seen[name] then break end
+        seen[name] = true
+        local transform = unwrap(prop(widget, 'RenderTransform'))
+        local position = unwrap(prop(transform, 'Translation'))
+        local scale = unwrap(prop(transform, 'Scale'))
+        nodes[#nodes + 1] = string.format('%s [vis=%s opacity=%s xy=%s,%s scale=%s,%s]', name,
+          text(prop(widget, 'Visibility')), text(prop(widget, 'RenderOpacity')),
+          text(prop(position, 'X')), text(prop(position, 'Y')), text(prop(scale, 'X')), text(prop(scale, 'Y')))
+        local parent = Util.call(widget, 'GetParent')
+        if not valid(parent) then
+          nodes[#nodes + 1] = 'parent=nil outer=' .. text(Util.call(Util.call(widget, 'GetOuter'), 'GetFullName'))
+            .. ' viewport=' .. text(Util.call(widget, 'IsInViewport'))
+          break
+        end
+        widget = parent
+      end
+      log('native HUD probe: ' .. phase .. ' ' .. label .. ' ' .. table.concat(nodes, ' <- '))
+    end
+    log('native HUD probe: ' .. phase .. ' layout=' .. record.name .. ' targets=' .. #record.items)
+    chain('layout', record.layout)
+    for i = 1, math.min(#record.items, 16) do chain('target' .. i, record.items[i].widget) end
+    for _, name in ipairs({ 'WB_PlayerHPBar_82', 'WB_quickslot', 'W_WeaponUI' }) do
+      local widget = unwrap(prop(record.layout, name))
+      chain('actual.' .. name, widget)
+      local tree = unwrap(prop(widget, 'WidgetTree'))
+      chain('root.' .. name, unwrap(prop(tree, 'RootWidget')))
+    end
+    chain('follow.playerhud', hudSource.widget)
+    if phase ~= 'before' then return end
+    local animation = unwrap(prop(record.layout, 'hudhide'))
+    local bindings = prop(animation, 'AnimationBindings')
+    for i = 1, math.min(bindings and #bindings or 0, 32) do
+      local binding = unwrap(bindings[i])
+      log('native HUD probe: binding ' .. i .. ' widget=' .. text(prop(binding, 'WidgetName'))
+        .. ' slot=' .. text(prop(binding, 'SlotWidgetName')) .. ' root=' .. text(prop(binding, 'bIsRootWidget')))
+    end
+    local scene = unwrap(prop(animation, 'MovieScene'))
+    local objects = prop(scene, 'ObjectBindings')
+    log('native HUD probe: movie bindings=' .. text(objects and #objects))
+    for i = 1, math.min(objects and #objects or 0, 16) do
+      local object = unwrap(objects[i])
+      local tracks = prop(object, 'Tracks')
+      for j = 1, math.min(tracks and #tracks or 0, 8) do
+        local track = unwrap(tracks[j])
+        local binding = unwrap(prop(track, 'PropertyBinding'))
+        log('native HUD probe: track ' .. text(prop(object, 'BindingName')) .. ' '
+          .. text(Util.call(track, 'GetFullName')) .. ' property=' .. text(prop(binding, 'PropertyName'))
+          .. ' path=' .. text(prop(binding, 'PropertyPath')))
+      end
+    end
+  end)
+  if not ok then log('native HUD probe: ' .. phase .. ' failed: ' .. tostring(err)) end
 end
 
--- 同一层里按分数顺序取「第一个没被硬隐藏（Collapsed / Hidden）的候选」：
--- 常态下就是第一个，一次父链检查就够；游戏换了实例时旧实例先 Collapsed，
--- 自然落到新实例上。返回第 4 个值表示这一层到底有没有有效实例，
--- 用来决定要不要退到下一层；顺手把「有候选已经失效」记到 stale 上。
-local function probeTier(items)
-  local firstVisible, firstFactor, firstHidden = nil, 0, true
-  local any = false
-  for i = 1, #items do
-    local widget = items[i]
-    if valid(widget) then
-      any = true
-      local visible, factor, hardHidden = widgetChainVisible(widget, true)
-      if not hardHidden then return visible, factor, hardHidden, true end
-      if firstVisible == nil then firstVisible, firstFactor, firstHidden = visible, factor, hardHidden end
+local function updateNativePreview(now, enabled, pc, pawn)
+  if not enabled then
+    releaseNativePreview()
+    nativePreview.nextAt, nativePreview.status = 0, nil
+    return
+  end
+  local record = nativePreview.record
+  if record and pc and pawn and (record.pc ~= pc or record.pawn ~= pawn) then
+    nativePreview.record, record = nil, nil
+    nativePreview.nextAt = 0
+  end
+  if not pc or not pawn then releaseNativePreview(); return end
+  if record and record.releaseAt then
+    if not releaseNativePreview() then return end
+    record = nil
+  end
+  if now >= nativePreview.nextAt then
+    nativePreview.nextAt = now + 0.5
+    if not valid(pc) or not valid(pawn) then releaseNativePreview(); return end
+    local layout = Util.call(Util.cls('/Script/ProjectPBZ.Default__PBZHUDLayout'), 'GetHUDLayout', pc)
+    local name = Util.call(layout, 'GetFullName')
+    if record and record.name ~= name then
+      if not releaseNativePreview() then return end
+      record = nil
+    end
+    if not name then
+      previewStatus('layout unavailable')
+      releaseNativePreview()
+      return
+    end
+    local player = Util.call(layout, 'GetOwningLocalPlayer')
+    local settings = Util.call(player, 'GetSharedSettings')
+    local mode = Util.call(settings, 'GetHUDCharacterStateMode')
+    if mode ~= 0 and mode ~= 1 then
+      previewStatus(mode == 2 and 'disabled by game settings' or 'game settings unavailable')
+      releaseNativePreview()
+      return
+    end
+    if not record then
+      local items = previewFadeTargets(layout)
+      if not items then previewStatus('no fade targets on ' .. name); return end
+      record = { layout = layout, name = name, items = items, pc = pc, pawn = pawn }
+      nativePreview.record = record
     else
-      hudPick.stale = true
+      record.layout = layout
     end
   end
-  if firstVisible ~= nil then return firstVisible, firstFactor, firstHidden, true end
-  return nil, 0, true, any
+  if not record then return end
+  if not valid(record.layout) or Util.call(record.layout, 'IsActivated') ~= true then
+    previewStatus('layout inactive')
+    releaseNativePreview()
+    return
+  end
+  local _, _, hardHidden = widgetChainVisible(record.layout, true)
+  if hardHidden then
+    previewStatus('layout hidden')
+    releaseNativePreview()
+    return
+  end
+  local sample = debugOn and (record.debugSamples or 0) < 2
+  if sample then
+    record.debugSamples = (record.debugSamples or 0) + 1
+    previewSnapshot(record, record.debugSamples == 1 and 'before' or 'next-frame-before')
+  end
+  -- hudhide 还会隐藏 playerhud；只接管该容器，不改子控件的独立隐藏状态。
+  local failed = false
+  for _, item in ipairs(record.items) do
+    if not valid(item.widget) then
+      previewStatus('fade target invalid')
+      releaseNativePreview()
+      nativePreview.nextAt = 0
+      return
+    end
+    if item.visibilityTarget then
+      local visibility = prop(item.widget, 'Visibility')
+      if visibility == VIS.Hidden or visibility == VIS.Collapsed then
+        item.wasVisibility = visibility
+        if pcall(function() item.widget:SetVisibility(VIS.SelfHitTestInvisible) end)
+            and prop(item.widget, 'Visibility') == VIS.SelfHitTestInvisible then
+          item.visibilityApplied = true
+        else
+          failed = true
+        end
+      elseif visibility ~= VIS.SelfHitTestInvisible then
+        item.visibilityApplied = false
+      end
+    end
+    local opacity = prop(item.widget, 'RenderOpacity')
+    if type(opacity) == 'number' and opacity ~= 1 then
+      item.was = opacity
+      if pcall(function() item.widget:SetRenderOpacity(1) end) then
+        item.applied = true
+      else
+        failed = true
+      end
+    end
+  end
+  if sample and record.debugSamples == 1 then previewSnapshot(record, 'after') end
+  previewStatus(failed and 'property write failed' or 'running (visibility unverified)')
 end
 
--- 返回：是否显示 / 连续不透明度 / 是否被硬隐藏（Collapsed、Hidden）。
--- 第一个返回值为 nil 表示连候选控件都没有（读图、进游戏前）。
-local function probeHud(now)
-  if hudPick.loading then
-    -- 加载中：清单已经清空，绝不回去读旧对象的任何属性。
-    if now - hudPick.loadingAt > LOAD_GUARD_MAX then hudPick.loading = false end
-    return nil, 0, true
-  end
-  if now < hudPick.settleAt then return nil, 0, true end
+local function clearHudSource()
+  hudSource.layout, hudSource.widget, hudSource.chain = nil, nil, nil
+  hudSource.pc, hudSource.pawn, hudSource.nextAt = nil, nil, 0
+end
 
-  if hudPick.ready then
-    -- 换了 PlayerController 或 Pawn（读图、复活、切场景）必然换了 HUD 实例，
-    -- 直接作废清单，不必等可见性验证失败。
-    local pc = localPC()
-    local pawn = valid(pc) and prop(pc, 'Pawn') or nil
-    if pc ~= hudPick.pc or pawn ~= hudPick.pawn then hudPick.dirty = true end
+local function probeHud(now, pc, pawn)
+  if Util.mapGuard() or hudSource.loading or now < hudSource.settleAt then return nil, 0, true end
+  if pc ~= hudSource.pc or pawn ~= hudSource.pawn then
+    clearHudSource()
+    hudSource.pc, hudSource.pawn = pc, pawn
   end
-  if (not hudPick.ready or hudPick.dirty) and now - hudPick.at >= HUD_RESCAN_GAP then
-    pcall(buildHudList)
-  end
-
-  hudPick.stale = false
-  for t = 1, #HUD_TIERS do
-    local visible, factor, hardHidden, any = probeTier(hudPick.tiers[t])
-    if any then
-      -- 只有隐藏状态下才按 TTL 定期重扫：隐藏时游戏可能换了新实例，
-      -- 而常态显示时一个候选就够用，不必再花 FindAllOf 的钱。
-      hudPick.dirty = hudPick.stale
-        or (not visible and now - hudPick.at >= HUD_LIST_TTL)
-      return visible, factor, hardHidden
+  if not pc or not pawn then return nil, 0, true end
+  if now >= hudSource.nextAt then
+    hudSource.nextAt = now + HUD_SOURCE_INTERVAL
+    hudSource.layout, hudSource.widget, hudSource.chain = nil, nil, nil
+    local layout = Util.call(Util.cls('/Script/ProjectPBZ.Default__PBZHUDLayout'), 'GetHUDLayout', pc)
+    if valid(layout) then
+      local widget = unwrap(prop(layout, 'playerhud'))
+      if valid(widget) then
+        local chain, seen = {}, {}
+        -- UUserWidget 的内部根不经 GetParent 连回布局，因此两条链都要保留。
+        for _, root in ipairs({ widget, layout }) do
+          local node = root
+          for _ = 1, 8 do
+            if not valid(node) or seen[node] then break end
+            seen[node] = true
+            chain[#chain + 1] = node
+            node = Util.call(node, 'GetParent')
+          end
+        end
+        hudSource.layout, hudSource.widget, hudSource.chain = layout, widget, chain
+      end
     end
   end
-  hudPick.dirty = true
-  return nil, 0, true
+  if not hudSource.chain then return nil, 0, true end
+  if Util.call(hudSource.layout, 'IsActivated') ~= true then return false, 0, true end
+  local factor = 1
+  for _, node in ipairs(hudSource.chain) do
+    if not valid(node) then
+      hudSource.layout, hudSource.widget, hudSource.chain = nil, nil, nil
+      return nil, 0, true
+    end
+    local visibility = prop(node, 'Visibility')
+    if visibility == VIS.Hidden or visibility == VIS.Collapsed then return false, 0, true end
+    local opacity = prop(node, 'RenderOpacity')
+    if type(opacity) ~= 'number' or visibility == nil then return nil, 0, true end
+    factor = math.min(factor, math.max(0, math.min(1, opacity)))
+  end
+  return factor > 0.01, factor, false
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -304,6 +443,7 @@ local previous = {}
 for key, value in pairs(S) do previous[key] = value end
 local function onChange(keys)
   debugOn = S.Debug == true
+  local barsChanged = false
   for _, key in ipairs(keys) do
     if S[key] ~= previous[key] then
       previous[key] = S[key]
@@ -311,8 +451,12 @@ local function onChange(keys)
       if kind == 'rebuild' then pendingRebuildAt = os.clock() + 0.25
       elseif kind == 'transform' then pendingTransforms = true
       elseif kind == 'colour' then pendingColours = true end
+      if key == 'HideNativeHud' or key == 'NativeBars' or key == 'HudBarWidth' or key == 'NativePinRecover' then
+        barsChanged = true
+      end
     end
   end
+  if barsChanged then hudBars:wake() end
 end
 local pendingEvent
 local reader = Reader.new(env, {
@@ -344,6 +488,47 @@ local function inputIgnored(pc, which)
     else v = pc:IsLookInputIgnored() == true end
   end)
   return v
+end
+
+local nativeHotkey = {}
+local pendingNativeHud
+
+local function updateNativeHotkey(snapshot)
+  local ready = memory and reader.lastDraft.HideNativeHud ~= nil
+  -- 框架首次打开面板才登记模组，先把此前的快捷键修改合入草稿。
+  if ready and pendingNativeHud then
+    reader:save(pendingNativeHud, true)
+    pendingNativeHud = nil
+  end
+  local name = S.ToggleNativeHudKey
+  if type(name) ~= 'string' or name == '' then
+    nativeHotkey.name, nativeHotkey.arg, nativeHotkey.pc, nativeHotkey.down = nil, nil, nil, nil
+    return
+  end
+  if name ~= nativeHotkey.name then
+    nativeHotkey.name, nativeHotkey.arg, nativeHotkey.down = name, nil, nil
+    pcall(function() nativeHotkey.arg = { KeyName = FName(name) } end)
+  end
+  local pc = snapshot and snapshot.pc
+  if configVisible or drag.active or not pc or not snapshot.pawn or not nativeHotkey.arg
+    or prop(pc, 'bShowMouseCursor') == true or inputIgnored(pc, 'move') then
+    nativeHotkey.pc, nativeHotkey.down = nil, nil
+    return
+  end
+  if pc ~= nativeHotkey.pc then nativeHotkey.pc, nativeHotkey.down = pc, nil end
+  local down = Util.call(pc, 'IsInputKeyDown', nativeHotkey.arg)
+  local pressed = down == true and nativeHotkey.down == false
+  nativeHotkey.down = down
+  if not pressed then return end
+  local hide = not S.HideNativeHud
+  if ready then
+    reader:save({ HideNativeHud = hide }, true)
+  else
+    S.HideNativeHud = hide
+    S.HudNumbers = not hide
+    onChange({ 'HideNativeHud', 'HudNumbers' })
+    pendingNativeHud = { HideNativeHud = hide, HudNumbers = S.HudNumbers }
+  end
 end
 
 local function gameplayStatics()
@@ -465,11 +650,11 @@ Util.setMapGuard(false)
 local function releaseMapFreeze(source)
   if not RT.alive or not mapFreeze.hard then return end
   mapFreeze.hard = false
-  hudPick.loading = false
-  hudPick.settleAt = os.clock() + LOAD_SETTLE
-  mapGuardUntil = hudPick.settleAt + MAP_GUARD_EXTRA
+  hudSource.loading = false
+  hudSource.settleAt = os.clock() + LOAD_SETTLE
+  mapGuardUntil = hudSource.settleAt + MAP_GUARD_EXTRA
   heavyReady, heavyHeld = false, false
-  clearHudPick()
+  clearHudSource()
   -- PostHook 之后引擎才真正释放旧世界的对象，缓存可能在冻结期间又被填上。
   -- 再作废一次跨帧引用，避免观察期结束时重新拿到旧对象。
   if RT.onWorldTeardown then RT.onWorldTeardown() end
@@ -497,9 +682,9 @@ local function holdMapFreeze(source, hard)
   end
   -- 钩子回调到下一帧之间也不能解引用属性包装值。
   Util.setMapGuard(true)
-  hudPick.settleAt = math.max(hudPick.settleAt, now + LOAD_SETTLE)
+  hudSource.settleAt = math.max(hudSource.settleAt, now + LOAD_SETTLE)
   heavyReady, heavyHeld = false, false
-  clearHudPick()
+  clearHudSource()
   -- 统计快照 / 图标缓存 / 原生条条目里全是旧世界的对象，只丢引用。
   if RT.onWorldTeardown then RT.onWorldTeardown() end
 end
@@ -535,7 +720,7 @@ if RegisterLoadMapPreHook then
   local ok, err = pcall(function()
     RegisterLoadMapPreHook(function()
       -- 引擎 LoadMap 的入口：转为长冻结，等 PostHook 放行。
-      hudPick.loading, hudPick.loadingAt = loadPostAvailable, os.clock()
+      hudSource.loading = loadPostAvailable
       holdMapFreeze('LoadMap', true)
     end)
   end)
@@ -566,19 +751,10 @@ local fullSince = { hp = nil, qi = nil }
 local FULL_RATIO = 0.995
 -- 统计读数短暂沿用上一帧的最长时间（只用于盖住复活这种一两帧空档）。
 local HOLD_SNAPSHOT_MAX = 0.5
--- 实机结论：0.2 有明显延迟；0.05 一直跟手；再压到 0.01 会让常态几乎每帧
--- 都跑一次全量 FindAllOf，帧耗时抖动 + 采样周期逼近帧间隔（60fps≈16.7ms）
--- 造成相位不稳，反而偶发不跟手。固定 0.05，别再调这个值。
--- 淡出/淡入期间由下面的自适应分支逐帧镜像，跟手程度不再由它决定；
--- 它只负责「常态」采样，以及发现游戏 HUD 开始隐藏的起点延迟。
-local HUD_POLL_INTERVAL = 0.05
-local HUD_FADE_MIN, HUD_FADE_MAX = 0.01, 0.999
+local HUD_FADE_MIN = 0.01
 -- 观测到的游戏 HUD 常态不透明度。镜像时按它归一化，这样即便游戏把 HUD
 -- 整体设成 0.9，MOD 常态仍是满亮，跟随的只是「相对淡出进度」。
 local hudBaseAlpha = 0
-local hudCacheAt = -1
-local hudCacheVisible, hudCacheFactor, hudCacheHidden = nil, 1, false
-local lastConfigVisible = false
 local traceTicks = 0
 local pending = { lmb = false, rmb = false, mmb = false }
 
@@ -588,6 +764,8 @@ local pending = { lmb = false, rmb = false, mmb = false }
 -- ProcessEvent / 读属性，就是 ACCESS_VIOLATION（crash dump 落在 UE4SS.dll）。
 -- 这里只做 Lua 侧的引用清理，不调用任何 UObject 方法。
 RT.onWorldTeardown = function()
+  nativeHotkey.pc, nativeHotkey.down = nil, nil
+  nativePreview = { nextAt = 0 }
   heldSnapshot, heldAt, cachedPC = nil, nil, nil
   Util.forgetClasses()
   pendingEvent = nil
@@ -606,7 +784,7 @@ RT.onWorldTeardown = function()
   pcall(function() hudBars:forget() end)
   follow.pawn = nil
   follow.viewport, follow.viewportAt = nil, -100
-  hudCacheAt = -1
+  clearHudSource()
   hudSeenVisible, hudHiddenSince, hudWasOn = false, nil, false
   hudBaseAlpha = 0
   fullSince.hp, fullSince.qi = nil, nil
@@ -656,23 +834,6 @@ local function readSnapshot(now)
   return nil, err
 end
 
-local function hudVisible(force)
-  local now = os.clock()
-  -- 淡出/淡入过程中逐帧重算；常态才走 0.05s 缓存。
-  -- force 用于「重模块还在等 HUD 出现」的那段时间：HUD 可能是硬切出现的（没有淡入），
-  -- 走 0.05s 缓存会晚 3 帧才认出来，那 3 帧足够让玩家看见原生条在缩短。
-  local base = hudBaseAlpha > HUD_FADE_MIN and hudBaseAlpha or 1
-  local fading = hudCacheFactor ~= nil and hudCacheFactor > HUD_FADE_MIN
-    and hudCacheFactor < base * HUD_FADE_MAX
-  if not force and not fading and now - hudCacheAt < HUD_POLL_INTERVAL then
-    return hudCacheVisible, hudCacheFactor, hudCacheHidden
-  end
-  hudCacheAt = now
-  local visible, factor, hardHidden = probeHud(now)
-  hudCacheVisible, hudCacheFactor, hudCacheHidden = visible, factor, hardHidden
-  return visible, factor, hardHidden
-end
-
 ---------------------------------------------------------------------------------------------------
 -- 每帧
 
@@ -680,14 +841,14 @@ local function step(dt)
   if not RT.alive then return true end
   local now = os.clock()
 
-  -- 换图冻结必须是 step 的第一件事。下面那些 stats:read、hudVisible、
+  -- 换图冻结必须是 step 的第一件事。下面那些 stats:read、probeHud、
   -- icons:update、hudBars:update 全都会碰游戏对象；旧世界一旦进入销毁流程，
   -- 哪怕只读一次属性都可能崩在 UE4SS 的反射路径上（pcall 挡不住 native AV）。
   -- 万一 PostHook 没来，LOAD_GUARD_MAX 秒后自动放行，不会把 MOD 永久冻住。
   if mapFreeze.hard and now - mapFreeze.at > LOAD_GUARD_MAX then
     releaseMapFreeze('guard timeout')
   end
-  local frozen = mapFreeze.hard or now < mapFreeze.preUntil or now < hudPick.settleAt
+  local frozen = mapFreeze.hard or now < mapFreeze.preUntil or now < hudSource.settleAt
   local guarded = frozen or now < mapGuardUntil
   Util.setMapGuard(guarded)
   if frozen then
@@ -701,11 +862,6 @@ local function step(dt)
   if mapGuardUntil > 0 then
     mapGuardUntil = 0
     alert('map load: guard released')
-  end
-
-  if configVisible ~= lastConfigVisible then
-    lastConfigVisible = configVisible
-    hudCacheAt = -1
   end
 
   if not renderAlive() then
@@ -731,6 +887,7 @@ local function step(dt)
   end
 
   local snapshot, statsError = readSnapshot(now)
+  updateNativeHotkey(snapshot)
   local trace = S.Debug and snapshot ~= nil and traceTicks < 3
   if trace then
     traceTicks = traceTicks + 1
@@ -768,8 +925,8 @@ local function step(dt)
     end
   end
 
-  -- 等门期间不用 0.05s 采样缓存：HUD 硬切出现时要当帧就认出来。
-  local hudShown, hudOpacity = hudVisible(not heavyReady)
+  if not configVisible then releaseNativePreview() end
+  local hudShown, hudOpacity = probeHud(now, snapshot and snapshot.pc, snapshot and snapshot.pawn)
   -- 游戏 HUD 的连续不透明度就是「淡出开始」的最早状态：RenderOpacity 刚从
   -- 1 掉下来的那一帧游戏才启动淡出，等到 Visibility 变 Hidden 已经是动画结束，
   -- 那时才让 MOD 开始自己的淡出，必然比游戏晚一整段动画。这里全程镜像这条曲线。
@@ -842,13 +999,15 @@ local function step(dt)
       -- 已经是钉好的长度，不会出现「先长后短」。
       heavyReady = true
       log(string.format('heavy modules resumed (hud on, after %.2fs)',
-        now - hudPick.settleAt))
-    elseif now - hudPick.settleAt >= SETTLE_FALLBACK then
+        now - hudSource.settleAt))
+    elseif now - hudSource.settleAt >= SETTLE_FALLBACK then
       -- 兜底：主界面 / 菜单里 HUD 一直不出现，也不能让原生条永远不干活。
       heavyReady = true
       log('heavy modules resumed (fallback)')
     end
   end
+
+  updateNativePreview(now, configVisible and heavyReady, snapshot and snapshot.pc, snapshot and snapshot.pawn)
 
   if heavyReady then
     if pendingEvent then
@@ -875,12 +1034,15 @@ local function step(dt)
     releaseDragInput(reader:panel())
   end
   local breakActive = breakWatch:update(snapshot and snapshot.pawn, now, heavyReady)
-  if S.Debug and heavyReady and snapshot then pcall(stats.probeCharges, stats, now, log) end
 
   if heavyReady then
     local iconsOk, iconsErr = pcall(function()
       icons:update(dt, {
         configVisible = configVisible,
+        -- 只有面板整页打开时才播控件预览；temp 态（收起面板继续玩）与游戏中
+        -- 必须显示真实数据，否则预览会一直循环。
+        preview = reader:panel() == 'open',
+        anchorX = anchorX, anchorY = anchorY, arcScale = lastScale,
         hudShown = configVisible or hudMirror > 0.01,
         hudFade = configVisible and 1 or hudMirror,
         -- 精纯杀气的充能比例（UltimateCharge / Max），图标模块用它画充能条。
@@ -898,8 +1060,7 @@ local function step(dt)
   end
 
   if heavyReady then
-    -- 配置面板开着时玩家随时在改原生条相关设置，全程保持高频。
-    if hudReturned or configVisible then hudBars:wake(hudReturned) end
+    if hudReturned then hudBars:wake(true) end
     local barsOk, barsErr = pcall(function() hudBars:update(dt, snapshot) end)
     if not barsOk and now - lastBarsError > 5 then
       lastBarsError = now
@@ -987,11 +1148,8 @@ local function step(dt)
       anchorY and string.format('%.0f', anchorY) or '?',
       lastScale, master, tostring(onscreen), tostring(visible), tostring(visibility),
       tostring(hpShown), tostring(qiShown), tonumber(S.HideDelay) or 3,
-      -- HUD 的显隐和它当前的淡出程度分开打，图标跟着 HUD 走时能看出滞后在哪一侧。
-      -- cand 是当前候选清单里的控件数，带 * 表示这次的结论让它作废、等着重扫，
-      -- 带 L 表示正处在读档 / 过图的保护期（这段时间不碰游戏控件）。
-      string.format('%s/%.2f cand=%d%s%s', tostring(hudShown), tonumber(hudOpacity) or -1,
-        hudPick.count, hudPick.dirty and '*' or '', hudPick.loading and 'L' or ''),
+      string.format('%s/%.2f source=%s', tostring(hudShown), tonumber(hudOpacity) or -1,
+        hudSource.widget and 'playerhud' or 'none'),
       tostring(follow.methodIndex)))
     log('bars hp[' .. barInfo(hb) .. '] qi[' .. barInfo(qb) .. '] th=' .. tostring(S.HpThickness) .. '/' .. tostring(S.QiThickness) ..
       ' hpcol=' .. tostring(S.HpColor) .. ' qicol=' .. tostring(S.QiColor))
@@ -1049,17 +1207,19 @@ function RT.shutdown()
     end)
     earlyHookIds = nil
   end
-  -- 卸载 / 热重载时把候选控件全部丢掉，别把 UObject 引用带出这次运行。
-  clearHudPick()
+  -- 卸载 / 热重载时丢掉 HUD 引用，避免带出本次运行。
+  clearHudSource()
   drag:forget()
   breakWatch:forget()
   breakDemo.active = false
-  if mapFreeze.hard or os.clock() < mapFreeze.preUntil or os.clock() < hudPick.settleAt
+  if mapFreeze.hard or os.clock() < mapFreeze.preUntil or os.clock() < hudSource.settleAt
     or os.clock() < mapGuardUntil then
     -- 冻结期对象正在销毁：只丢标记，不还输入（随旧世界一起失效）。
     dragInput.frozen, dragInput.pc, dragInput.paused = false, nil, false
+    nativePreview = { nextAt = 0 }
     hudBars:forget()
   else
+    if not releaseNativePreview(true) then alert('native HUD preview: shutdown restore failed') end
     releaseDragInput('closed')
     pcall(function() hudBars:destroy() end)
   end

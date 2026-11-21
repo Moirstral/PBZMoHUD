@@ -14,6 +14,7 @@ def runtime_files():
     paths = list((HERE / 'Scripts').glob('*.lua'))
     paths += [HERE / 'Scripts/settings.ini']
     paths += list((HERE / 'lang').glob('*.ini'))
+    paths += [HERE / 'assets/weapon-cooldown.png']
     paths += [HERE / name for name in ('enabled.txt', 'LICENSE', 'README.md', 'CHANGELOG.md')]
     return sorted(paths)
 

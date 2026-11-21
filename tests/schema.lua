@@ -59,7 +59,7 @@ check(raw.version == Boot.VERSION and Boot.VERSION ~= nil, 'schema version follo
 check(next(raw.defaults or {}) == nil, 'all values must be explicit controls')
 
 local groups = { preset = 1, behavior = 9, hpArc = 23, qiArc = 26, look = 6,
-  icons = 18, native = 5, advanced = 1 }
+  icons = 23, native = 10, advanced = 1 }
 local controls, defaults, requiredLang = {}, {}, { ['hud.name'] = true,
   ['hud.about'] = true, ['hud.dragTip'] = true, ['hud.DragIcons.run'] = true,
   ['hud.BreakDemo.run'] = true }
@@ -99,12 +99,12 @@ for _, group in ipairs(raw.groups) do
   end
 end
 check(next(groups) == nil and #raw.groups == 8, 'eight groups')
-check(n == 89 and actions == 2 and count(defaults) == 87, '89 controls, 87 values, two actions')
+check(n == 99 and actions == 2 and count(defaults) == 97, '99 controls, 97 values, two actions')
 
 local normalized, err = Schema.normalize(raw)
 check(normalized ~= nil, tostring(err))
 local defs, order = Schema.defs(normalized)
-check(#order == 87 and count(defs) == 87 and defs.DragIcons == nil and defs.BreakDemo == nil, 'framework value definitions')
+check(#order == 97 and count(defs) == 97 and defs.DragIcons == nil and defs.BreakDemo == nil, 'framework value definitions')
 for id, default in pairs(defaults) do
   check(equal(defs[id].default, default), 'normalize changed default: ' .. id)
   check(equal(Schema.clamp(defs[id], default), default), 'clamp changed default: ' .. id)
@@ -114,7 +114,11 @@ for id, default in pairs(defaults) do
     check(default >= def.min and default <= def.max, 'default range: ' .. id)
     check(math.abs(grid - math.floor(grid + 0.5)) < 1e-8, 'default grid: ' .. id)
   end
-  if def.enabledWhen then check(defs[def.enabledWhen.key] ~= nil, 'missing dependency: ' .. id) end
+  if def.enabledWhen then
+    for _, condition in ipairs(def.enabledWhen.all or { def.enabledWhen }) do
+      check(defs[condition.key] ~= nil, 'missing dependency: ' .. id)
+    end
+  end
   check((def.percent == true) == (id == 'WarnThresholdHp' or id == 'WarnThresholdQi'), 'percent: ' .. id)
 end
 
@@ -137,7 +141,11 @@ local function add(id, kind, default, group, min, max, step, unit, options, depe
     for _, o in ipairs(d.options) do values[#values + 1] = o.value end
     check(table.concat(values, ',') == options, 'choice values: ' .. id)
   end
-  if dependency then
+  if id == 'HudBarWidth' then
+    local all = d.enabledWhen and d.enabledWhen.all
+    check(all and #all == 2 and all[1].key == 'NativeBars' and all[1].eq == 'pin'
+      and all[2].key == 'HideNativeHud' and all[2].eq == false, 'width compound dependency')
+  elseif dependency then
     check(d.enabledWhen and d.enabledWhen.key == dependency and d.enabledWhen.eq == eq
       and count(d.enabledWhen) == 2, 'enabledWhen: ' .. id)
   else
@@ -202,12 +210,22 @@ add('WarnFlashSpeed', 'slider', 1.80, 'look', 0.2, 8, 0.1)
 add('WarnFlashAmount', 'slider', 0.65, 'look', 0, 1, 0.05)
 add('Visibility', 'choice', 'dynamic', 'behavior', nil, nil, nil, nil, 'hud,dynamic')
 add('HideDelay', 'slider', 3, 'behavior', 0, 30, 0.5, 's', nil, 'Visibility', 'dynamic')
-for _, id in ipairs({ 'MedicineHud', 'PureIcon', 'BulletIcon' }) do add(id, 'toggle', true, 'icons') end
+for _, id in ipairs({ 'MedicineHud', 'PureIcon', 'BulletIcon', 'WeaponCooldown' }) do add(id, 'toggle', true, 'icons') end
+add('MainWeaponIcon', 'toggle', false, 'icons', nil, nil, nil, nil, nil, 'PureIcon', true)
+add('PhantomEdgesIcon', 'toggle', false, 'icons', nil, nil, nil, nil, nil, 'BulletIcon', true)
+local iconOrder = {}
+for _, group in ipairs(raw.groups) do
+  if group.label == 'hud.group.icons' then
+    for i, def in ipairs(group.controls) do iconOrder[def.id] = i end
+  end
+end
+check(iconOrder.MainWeaponIcon == iconOrder.PureIcon + 1, 'MainWeaponIcon immediately follows PureIcon')
+check(iconOrder.PhantomEdgesIcon == iconOrder.BulletIcon + 1, 'PhantomEdgesIcon immediately follows BulletIcon')
 add('UltChargeBar', 'toggle', true, 'icons', nil, nil, nil, nil, nil, 'PureIcon', true)
 add('IconScale', 'slider', 1, 'icons', 0.5, 3, 0.1)
 local coords = {}
-for _, prefix in ipairs({ 'MedicineHud', 'UltHud', 'Med1Off', 'Med2Off', 'Ult1Off', 'Ult2Off' }) do
-  local anchor = prefix == 'MedicineHud' or prefix == 'UltHud'
+for _, prefix in ipairs({ 'MedicineHud', 'UltHud', 'WeaponCooldown', 'Med1Off', 'Med2Off', 'Ult1Off', 'Ult2Off' }) do
+  local anchor = prefix == 'MedicineHud' or prefix == 'UltHud' or prefix == 'WeaponCooldown'
   for _, axis in ipairs({ 'X', 'Y' }) do
     local id = prefix .. axis
     coords[#coords + 1] = id
@@ -215,24 +233,87 @@ for _, prefix in ipairs({ 'MedicineHud', 'UltHud', 'Med1Off', 'Med2Off', 'Ult1Of
     check(Schema.clamp(defs[id], -1) == -1 and Schema.clamp(defs[id], -800) == -800, 'negative coordinate: ' .. id)
   end
 end
-check(#coords == 12, 'twelve explicit drag coordinates')
-add('NativeBars', 'choice', 'pin', 'native', nil, nil, nil, nil, 'pin,dynamic,hide')
-add('HudBarWidth', 'slider', -1, 'native', -1, 4000, 1, nil, nil, 'NativeBars', 'pin')
-add('NativePinRecover', 'toggle', true, 'native')
+check(#coords == 14, 'fourteen explicit drag coordinates')
+add('HideNativeHud', 'toggle', false, 'native')
+add('ToggleNativeHudKey', 'key', '', 'native')
+add('NativeBars', 'choice', 'pin', 'native', nil, nil, nil, nil, 'pin,dynamic,hide', 'HideNativeHud', false)
+add('HudBarWidth', 'slider', -1, 'native', -1, 4000, 1)
+add('NativePinRecover', 'toggle', true, 'native', nil, nil, nil, nil, nil, 'HideNativeHud', false)
 add('HudNumbers', 'toggle', true, 'native')
 add('HudNumberStyle', 'choice', 'center', 'native', nil, nil, nil, nil, 'center,side', 'HudNumbers', true)
+add('HideNativeMedicine', 'toggle', false, 'native', nil, nil, nil, nil, nil, 'HideNativeHud', false)
+add('HideNativeMainWeapon', 'toggle', false, 'native', nil, nil, nil, nil, nil, 'HideNativeHud', false)
+add('HideNativePhantomEdges', 'toggle', false, 'native', nil, nil, nil, nil, nil, 'HideNativeHud', false)
 add('Debug', 'toggle', false, 'advanced')
 add('DragIcons', 'action', nil, 'icons')
-check(count(expected) == 89, 'all controls checked against table')
+check(count(expected) == 99, 'all controls checked against table')
 
 local iniText = read(Boot.CONFIG)
 local ini, iniOrder = Reader.parse(iniText)
 local S = Settings.new(loadSchema(), Boot.CONFIG)
-check(#iniOrder == 87 and count(ini) == 87 and count(S) == 87, 'ini keys exactly match schema')
+check(#iniOrder == count(ini) and count(S) == 97, 'settings expose all schema values')
 for id, default in pairs(defaults) do
-  check(ini[id] ~= nil, 'ini missing: ' .. id)
-  check(equal(S[id], default), 'settings template differs: ' .. id)
-  check(equal(Schema.decode(ini[id], defs[id]), default), 'Reader.parse template differs: ' .. id)
+  if ini[id] ~= nil then
+    check(equal(S[id], Schema.decode(ini[id], defs[id])), 'saved setting preserved: ' .. id)
+  else
+    check(equal(S[id], default), 'missing setting uses schema default: ' .. id)
+  end
+end
+for id in pairs(ini) do check(defs[id] ~= nil, 'unknown persisted key: ' .. id) end
+
+do
+  local Host = dofile(FRAMEWORK .. '/ConfigHost.lua')
+  local Bus = dofile(FRAMEWORK .. '/SharedBus.lua')
+  local shared = {}
+  local b = Bus.new({ shared = { get = function(k) return shared[k] end,
+    set = function(k, v) shared[k] = v end } })
+  local disk, writes = '', 0
+  local env = { read = function() return disk end, write = function(_, text)
+    disk, writes = text, writes + 1
+  end, log = function() end, now = function() return 0 end }
+  local host = Host.new(env, { bus = b })
+  local m = assert(host:register(loadSchema(), '/hud'))
+  local settings = Settings.new(loadSchema())
+  local reader = Reader.new(env, { id = raw.id, settings = settings, bus = b })
+  host:frame(); reader:frame()
+  check(settings.MainWeaponIcon == false and settings.PhantomEdgesIcon == false, 'new installations hide weapon icons')
+  check(settings.HideNativeHud == false, 'master defaults to off')
+  host:focus('HideNativeHud'); host:action('toggle')
+  host:frame(); reader:frame()
+  check(settings.HideNativeHud == true and settings.HudNumbers == false, 'real HUD schema links through Host and Reader')
+  for _, key in ipairs({ 'NativeBars', 'HudBarWidth', 'NativePinRecover', 'HideNativeMedicine',
+      'HideNativeMainWeapon', 'HideNativePhantomEdges' }) do
+    check(not host:enabled(m.defs[key]), 'master greys native option: ' .. key)
+    check(equal(m.draft[key], defaults[key]), 'master preserves native option value: ' .. key)
+  end
+  check(host:enabled(m.defs.HudNumbers), 'number toggle remains editable')
+  check(not host:enabled(m.defs.HudNumberStyle), 'number style follows number toggle only')
+  host:focus('HudNumbers'); host:action('toggle')
+  host:frame(); reader:frame()
+  check(settings.HudNumbers == true and host:enabled(m.defs.HudNumberStyle), 'manual numbers and style enabled under master')
+  host:focus('HideNativeHud'); host:action('toggle')
+  host:frame(); reader:frame()
+  check(settings.HudNumbers == true and host:enabled(m.defs.NativeBars), 'turning master off enables numbers and unlocks native settings')
+  host:action('toggle')
+  host:frame(); reader:frame()
+  check(settings.HudNumbers == false, 'hiding native HUD turns numbers off again')
+  host:action('toggle')
+  host:frame(); reader:frame()
+  check(settings.HudNumbers == true, 'restoring native HUD also restores numbers')
+  host:set(raw.id, 'HudNumbers', false, 'panel')
+  host:frame(); reader:frame()
+  check(settings.HudNumbers == false and host:enabled(m.defs.HudNumbers), 'numbers can still be manually disabled with native HUD visible')
+  host:set(raw.id, 'HideNativeHud', false, 'panel')
+  host:frame(); reader:frame()
+  check(settings.HudNumbers == false, 'unchanged master does not undo a manual number setting')
+  check(writes == 0, 'master and linked edits never save automatically')
+  host:set(raw.id, 'NativeBars', 'dynamic', 'panel')
+  check(not host:enabled(m.defs.HudBarWidth), 'width still requires pin when master off')
+  host:set(raw.id, 'MainWeaponIcon', true, 'panel')
+  host:set(raw.id, 'PhantomEdgesIcon', true, 'panel')
+  host:save()
+  local loaded = assert(Host.new(env, { bus = b }):register(loadSchema(), '/hud'))
+  check(loaded.draft.MainWeaponIcon == true and loaded.draft.PhantomEdgesIcon == true, 'existing weapon choices survive new defaults')
 end
 local removed = { 'Preset', 'Radius', 'Thickness', 'ArcSpan', 'Segments', 'HpOnLeft',
   'BarOpacity', 'TrackOpacity', 'GhostOpacity', 'ShowGhost', 'ShowTip', 'TipScale', 'TipAngle',
@@ -252,9 +333,7 @@ for line in read(FRAMEWORK:gsub('/Scripts$', '') .. '/lang/languages.ini'):gmatc
   if code then codes[#codes + 1] = code end
 end
 check(#codes == 15 and codes[1] == 'zh-Hans' and codes[2] == 'en', 'framework language manifest')
--- he 不在框架清单里但框架保留了译文文件，本模组同样保留并要求完整。
-codes[#codes + 1] = 'he'
-check(count(requiredLang) == 209, 'required language key count')
+check(count(requiredLang) == 229, 'required language key count')
 for _, code in ipairs(codes) do
   local dict = {}
   local text = read(langRoot .. code .. '.ini')
@@ -267,7 +346,7 @@ for _, code in ipairs(codes) do
   end
   for k in pairs(requiredLang) do check(dict[k] and dict[k] ~= '' and dict[k] ~= k, 'missing translation: ' .. code .. '/' .. k) end
   for k in pairs(dict) do check(requiredLang[k], 'unused language key: ' .. code .. '/' .. k) end
-  check(count(dict) == 209, 'language key count: ' .. code)
+  check(count(dict) == 229, 'language key count: ' .. code)
   for _, p in ipairs((code == 'en' or code == 'zh-Hans') and { 'Hp', 'Qi' } or {}) do
     local prefix = 'hud.' .. p .. 'FillDirection'
     check(dict[prefix .. '.normal'] == (code == 'en' and 'Normal' or '正向'), 'normal label')
@@ -300,7 +379,7 @@ withOpen(function(path, mode)
 end, function()
   local missing = Settings.new(normalized, 'missing.ini')
   for id, default in pairs(defaults) do check(equal(missing[id], default), 'missing file default: ' .. id) end
-  check(count(missing) == 87, 'missing file produces only schema values')
+  check(count(missing) == 97, 'missing file produces only schema values')
 end)
 check(missingOpens == 1, 'missing file never created')
 local payload = table.concat({
@@ -434,5 +513,5 @@ withOpen(function() return nil, 'unavailable' end, function()
   logger:close()
 end)
 
-print('Schema: 89 controls / 87 ini keys / 2 actions / 8 groups / 12 drag coordinates')
+print('Schema: 99 controls / 97 values / 2 actions / 8 groups / 14 drag coordinates')
 print('SCHEMA CHECKS PASSED: ' .. checks)

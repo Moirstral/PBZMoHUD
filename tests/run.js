@@ -26,11 +26,13 @@ function filesIn(dir) {
       lua.global.set('SCRIPTS', 'PBZMoHUD/Scripts');
       lua.global.set('TESTS', 'PBZMoHUD/tests');
       lua.global.set('FRAMEWORK', 'PBZMoConfig/Scripts');
-      lua.global.set('COMPILE_LIST', files.filter((file) => file.endsWith('.lua') && file.startsWith(path.join(workspace, 'PBZMoHUD')))
+      lua.global.set('COMPILE_LIST', files.filter((file) => file.endsWith('.lua'))
         .map((file) => path.relative(workspace, file).replace(/\\/g, '/')));
       lua.doStringSync("package.path = SCRIPTS .. '/?.lua;' .. package.path");
       if (script === 'compile') {
         lua.doStringSync("for _, p in ipairs(COMPILE_LIST) do local f=assert(io.open(p,'r')); local s=f:read('*a'); f:close(); assert(load(s,'@'..p,'t')) end; print('Lua syntax OK: '..#COMPILE_LIST..' files')");
+      } else if (script === 'framework') {
+        lua.doStringSync("SPEC_DIR = 'PBZMoConfig/tests'; dofile(SPEC_DIR .. '/spec.lua')");
       } else {
         if (!/^[a-zA-Z0-9_.-]+\.lua$/.test(script)) throw new Error('Expected a test filename');
         lua.doStringSync(`dofile(TESTS .. '/${script}')`);

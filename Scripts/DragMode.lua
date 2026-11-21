@@ -6,6 +6,7 @@ local DIR = debug.getinfo(1, 'S').source:gsub('^@', ''):gsub('\\', '/')
 local LANG_DIR = DIR .. '/../lang/'
 local COORDS = {
   MedicineHudX = -1, MedicineHudY = -1, UltHudX = -1, UltHudY = -1,
+  WeaponCooldownX = -1, WeaponCooldownY = -1,
   Med1OffX = 0, Med1OffY = 0, Med2OffX = 0, Med2OffY = 0,
   Ult1OffX = 0, Ult1OffY = 0, Ult2OffX = 0, Ult2OffY = 0,
 }
@@ -165,7 +166,7 @@ function DragMode:press(button)
   self.dragging = nil
   if button == 'mmb' then return self:resetSet() end
   local gx, gy = self.icons:groupOrigin(group)
-  local single = button == 'rmb' and entry or nil
+  local single = group ~= 'cooldown' and button == 'rmb' and entry or nil
   self.dragging = {
     anchor = group, entry = single, button = button,
     dx = x - (single and ex or gx), dy = y - (single and ey or gy),
@@ -194,7 +195,9 @@ function DragMode:poll(dt)
     drag.lastX, drag.lastY = x, y
     if held == true then
       self.icons:computeLayout()
-      if drag.entry then
+      if drag.anchor == 'cooldown' then
+        self.icons:setGroupAt('cooldown', x - drag.dx, y - drag.dy)
+      elseif drag.entry then
         local gx, gy = self.icons:groupOrigin(drag.anchor)
         local ox = math.floor(x - drag.dx - gx - drag.entry.offset + 0.5)
         local oy = math.floor(y - drag.dy - gy + 0.5)

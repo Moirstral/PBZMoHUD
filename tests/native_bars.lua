@@ -426,6 +426,32 @@ assert(result.rebuiltArcOld.numbers == 2)
 count(result.released, 0, 0)
 assert(result.releasedArc.numbers == 0)
 
+do
+  bars:release()
+  inst, root = buildBar('Master')
+  for _, mode in ipairs({ 'pin', 'dynamic', 'hide' }) do
+    S.NativeBars, S.HudNumbers, S.HideNativeHud = mode, false, false
+    frames(60)
+    S.HideNativeHud = true
+    frames(4)
+    count(measure(root), 9, 0)
+    assert(root.Visibility == 0 and S.NativeBars == mode, 'master keeps container and saved bar mode')
+    count(measure(arcs.group), 0, 0)
+    S.HudNumbers = true
+    frames(4)
+    count(measure(root), 9, 0)
+    assert(measure(arcs.group).numbers == 2, 'manually enabled numbers appear on arcs under master')
+    S.HudNumbers = false
+    frames(4)
+    count(measure(arcs.group), 0, 0)
+    S.HideNativeHud = false
+    frames(4)
+    count(measure(root), mode == 'hide' and 9 or 0, 0)
+    assert(S.HudNumbers == false, 'master release never reenables numbers')
+  end
+  bars:release()
+end
+
 local function grew(bar, x, show)
   bar.hp._values.BarX, bar.hp._values.CachedShowUp = x, show
   bar.qi._values.BarX, bar.qi._values.CachedShowUp = x * 0.8, show * 0.8
@@ -533,7 +559,7 @@ assert(logCount('pin readback failed') == alerts + 1)
 frames(4, 0.5)
 assert(entry.generation == generation and logCount('pin readback failed') == alerts + 1)
 S.NativePinRecover = true
--- 实机里改这个开关时配置面板开着，main 每帧都会 wake。
+-- 原生条设置变化时立即唤醒。
 bars:wake()
 frames(1, 0.5)
 assert(entry.generation > generation, '重新开启后下一采样未重绑')
@@ -632,7 +658,7 @@ frames(4, 1)
 grew(inst, 930, 0.5)
 frames(1)
 stillGrown(930)
-bars:wake()                        -- main：HUD 重新出现 / 配置面板开着
+bars:wake()                        -- HUD 重新出现或原生条设置变化
 frames(1)
 pinned(inst)
 frames(4, 1)
