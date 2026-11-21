@@ -211,8 +211,8 @@ add('WarnFlashAmount', 'slider', 0.65, 'look', 0, 1, 0.05)
 add('Visibility', 'choice', 'dynamic', 'behavior', nil, nil, nil, nil, 'hud,dynamic')
 add('HideDelay', 'slider', 3, 'behavior', 0, 30, 0.5, 's', nil, 'Visibility', 'dynamic')
 for _, id in ipairs({ 'MedicineHud', 'PureIcon', 'BulletIcon', 'WeaponCooldown' }) do add(id, 'toggle', true, 'icons') end
-add('MainWeaponIcon', 'toggle', false, 'icons', nil, nil, nil, nil, nil, 'PureIcon', true)
-add('PhantomEdgesIcon', 'toggle', false, 'icons', nil, nil, nil, nil, nil, 'BulletIcon', true)
+add('MainWeaponIcon', 'toggle', true, 'icons', nil, nil, nil, nil, nil, 'PureIcon', true)
+add('PhantomEdgesIcon', 'toggle', true, 'icons', nil, nil, nil, nil, nil, 'BulletIcon', true)
 local iconOrder = {}
 for _, group in ipairs(raw.groups) do
   if group.label == 'hud.group.icons' then
@@ -276,7 +276,7 @@ do
   local settings = Settings.new(loadSchema())
   local reader = Reader.new(env, { id = raw.id, settings = settings, bus = b })
   host:frame(); reader:frame()
-  check(settings.MainWeaponIcon == false and settings.PhantomEdgesIcon == false, 'new installations hide weapon icons')
+  check(settings.MainWeaponIcon == true and settings.PhantomEdgesIcon == true, 'weapon icons default to on')
   check(settings.HideNativeHud == false, 'master defaults to off')
   host:focus('HideNativeHud'); host:action('toggle')
   host:frame(); reader:frame()
@@ -309,11 +309,11 @@ do
   check(writes == 0, 'master and linked edits never save automatically')
   host:set(raw.id, 'NativeBars', 'dynamic', 'panel')
   check(not host:enabled(m.defs.HudBarWidth), 'width still requires pin when master off')
-  host:set(raw.id, 'MainWeaponIcon', true, 'panel')
-  host:set(raw.id, 'PhantomEdgesIcon', true, 'panel')
+  host:set(raw.id, 'MainWeaponIcon', false, 'panel')
+  host:set(raw.id, 'PhantomEdgesIcon', false, 'panel')
   host:save()
   local loaded = assert(Host.new(env, { bus = b }):register(loadSchema(), '/hud'))
-  check(loaded.draft.MainWeaponIcon == true and loaded.draft.PhantomEdgesIcon == true, 'existing weapon choices survive new defaults')
+  check(loaded.draft.MainWeaponIcon == false and loaded.draft.PhantomEdgesIcon == false, 'saved weapon icon choices override defaults')
 end
 local removed = { 'Preset', 'Radius', 'Thickness', 'ArcSpan', 'Segments', 'HpOnLeft',
   'BarOpacity', 'TrackOpacity', 'GhostOpacity', 'ShowGhost', 'ShowTip', 'TipScale', 'TipAngle',
