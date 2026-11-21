@@ -2,6 +2,29 @@
 
 只记录玩家能直接看到或感觉到的变化。完整设置项说明见 `README.md`。
 
+## PBZMoHUD 1.1.0 — 2026-11-21
+
+### 新增
+- 「隐藏原生HUD」总开关：游戏原生的药瓶、血量条、杀气条与武器区域一起隐藏，BOSS 血条不受影响。
+  可绑快捷键，在游戏里随时切换。
+- 三个细分开关：单独隐藏原生药瓶、原生武器、原生影之武装。
+- 图标可换成当前装备：用当前武器图标替换精纯杀气图标，用当前影之武装图标替换暗源图标。
+- 切换武器冷却圆环：显示在杀气弧内侧，冷却结束自动消失；可拖动单独定位。
+
+### 调整
+- 分组「原生条」改名「原生HUD」，原生条的固定长度等选项归在它下面。
+- 打开「隐藏原生HUD」时一起关掉血量与杀气数值，可以手动再开；关掉总开关时数值恢复。
+- 精纯杀气充能改成从下往上填亮图标，换成武器图标后同样生效。
+- 打开 `Debug` 时日志写到模组根目录的 `PBZMoHUD.log`，不再写在 `Scripts/` 下。
+
+### 兼容
+- `settings.ini` 新增 `HideNativeHud`、`ToggleNativeHudKey`、`HideNativeMedicine`、`HideNativeMainWeapon`、
+  `HideNativePhantomEdges`、`MainWeaponIcon`、`PhantomEdgesIcon`、`WeaponCooldown`、
+  `WeaponCooldownX`、`WeaponCooldownY`；旧文件缺这些键时按面板默认值处理。
+- 武器图标与影之武装图标**默认开启**：精纯杀气图标会换成当前武器、暗源图标会换成当前影之武装。
+  想保留原图标，到面板关掉「显示武器」/「显示影之武装」（`MainWeaponIcon` / `PhantomEdgesIcon`）。
+- 发布包新增 `assets/weapon-cooldown.png`（冷却圆环贴图），升级时连同 `assets/` 一起覆盖。
+
 ## PBZMoHUD 1.0.2 — 2026-11-16
 
 ### 新增

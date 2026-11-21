@@ -103,9 +103,9 @@ return {
     { label = 'hud.group.icons', controls = {
       { id = 'MedicineHud', type = 'toggle', label = 'hud.MedicineHud', tip = 'hud.MedicineHud.tip', default = true, effect = 'immediate' },
       { id = 'PureIcon', type = 'toggle', label = 'hud.PureIcon', tip = 'hud.PureIcon.tip', default = true, effect = 'immediate' },
-      { id = 'MainWeaponIcon', type = 'toggle', label = 'hud.MainWeaponIcon', tip = 'hud.MainWeaponIcon.tip', default = false, effect = 'immediate', enabledWhen = { key = 'PureIcon', eq = true } },
+      { id = 'MainWeaponIcon', type = 'toggle', label = 'hud.MainWeaponIcon', tip = 'hud.MainWeaponIcon.tip', default = true, effect = 'immediate', enabledWhen = { key = 'PureIcon', eq = true } },
       { id = 'BulletIcon', type = 'toggle', label = 'hud.BulletIcon', tip = 'hud.BulletIcon.tip', default = true, effect = 'immediate' },
-      { id = 'PhantomEdgesIcon', type = 'toggle', label = 'hud.PhantomEdgesIcon', tip = 'hud.PhantomEdgesIcon.tip', default = false, effect = 'immediate', enabledWhen = { key = 'BulletIcon', eq = true } },
+      { id = 'PhantomEdgesIcon', type = 'toggle', label = 'hud.PhantomEdgesIcon', tip = 'hud.PhantomEdgesIcon.tip', default = true, effect = 'immediate', enabledWhen = { key = 'BulletIcon', eq = true } },
       { id = 'UltChargeBar', type = 'toggle', label = 'hud.UltChargeBar', tip = 'hud.UltChargeBar.tip', default = true, effect = 'immediate', enabledWhen = { key = 'PureIcon', eq = true } },
       { id = 'WeaponCooldown', type = 'toggle', label = 'hud.WeaponCooldown', tip = 'hud.WeaponCooldown.tip', default = true, effect = 'immediate' },
       { id = 'WeaponCooldownX', type = 'slider', label = 'hud.WeaponCooldownX', tip = 'hud.WeaponCooldownX.tip', default = -1, min = -10000, max = 20000, step = 1, unit = 'px', effect = 'immediate' },
